@@ -174,7 +174,6 @@ if __name__ == "__main__":
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
-        report_to=["tensorboard"]
     )
     trainer.train()
 
