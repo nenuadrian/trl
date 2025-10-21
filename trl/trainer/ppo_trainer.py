@@ -581,8 +581,9 @@ class PPOTrainer(BaseTrainer):
                     advantages_reversed.append(lastgaelam)
                 advantages = torch.stack(advantages_reversed[::-1], axis=1)
                 returns = advantages + values
-                advantages = masked_whiten(advantages, ~padding_mask)
-                advantages = torch.masked_fill(advantages, padding_mask, 0)
+                if args.whiten_advantages:
+                    advantages = masked_whiten(advantages, ~padding_mask)
+                    advantages = torch.masked_fill(advantages, padding_mask, 0)
                 empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
