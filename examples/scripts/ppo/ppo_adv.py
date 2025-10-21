@@ -86,6 +86,7 @@ if __name__ == "__main__":
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
     # remove output_dir if exists
     shutil.rmtree(training_args.output_dir, ignore_errors=True)
+    print(training_args)
 
     ################
     # Model & Tokenizer
