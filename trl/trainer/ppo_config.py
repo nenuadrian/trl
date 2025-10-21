@@ -45,6 +45,8 @@ class PPOConfig(OnPolicyConfig):
             Number of epochs to train.
         whiten_rewards (`bool`, *optional*, defaults to `False`):
             Whether to whiten the rewards.
+        whiten_advantages (`bool`, *optional*, defaults to `False`):
+            Whether to whiten the advantages.
         kl_coef (`float`, *optional*, defaults to `0.05`):
             KL coefficient.
         kl_estimator (`Literal["k1", "k3"]`, *optional*, defaults to `"k1"`):
@@ -91,6 +93,10 @@ class PPOConfig(OnPolicyConfig):
     whiten_rewards: bool = field(
         default=False,
         metadata={"help": "Whether to whiten the rewards."},
+    )
+    whiten_advantages: bool = field(
+        default=False,
+        metadata={"help": "Whether to whiten the advantages."},
     )
     kl_coef: float = field(
         default=0.05,
