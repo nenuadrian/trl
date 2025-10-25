@@ -35,6 +35,7 @@ from transformers import (
     HfArgumentParser,
 )
 from transformers import get_scheduler
+import argparse
 
 from trl import (
     ModelConfig,
@@ -85,128 +86,196 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero3.yaml
 
 if __name__ == "__main__":
     parser = HfArgumentParser((ScriptArguments, PPOConfig, ModelConfig))
-    script_args, training_args, model_args = parser.parse_args_into_dataclasses()
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adam",
+        choices=["adam", "sgd", "all"],
+        help="Optimizer to use for training",
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        default=0.9,
+        help="Momentum for SGD optimizer",
+    )
+    parser.add_argument(
+        "--adam_betas",
+        type=float,
+        nargs=2,
+        default=[0.9, 0.999],
+        help="Beta parameters for Adam optimizer",
+    )
+    parser.add_argument(
+        "--adam_eps",
+        type=float,
+        default=1e-8,
+        help="Epsilon for Adam optimizer",
+    )
+    script_args, training_args, model_args, optimizer_args, _ = (
+        parser.parse_args_into_dataclasses(return_remaining_strings=True)
+    )
+
+    # Determine which optimizers to use
+    optimizers_to_use = []
+    if optimizer_args.optimizer == "all":
+        optimizers_to_use = ["adam", "sgd"]
+    else:
+        optimizers_to_use = [optimizer_args.optimizer]
+
     # remove output_dir if exists
     shutil.rmtree(training_args.output_dir, ignore_errors=True)
     print(training_args)
+    print(f"Optimizers to use: {optimizers_to_use}")
 
-    ################
-    # Model & Tokenizer
-    ################
-    dtype = (
-        model_args.dtype
-        if model_args.dtype in ["auto", None]
-        else getattr(torch, model_args.dtype)
-    )
-    model_kwargs = dict(
-        revision=model_args.model_revision,
-        attn_implementation=model_args.attn_implementation,
-        dtype=dtype,
-    )
-    quantization_config = get_quantization_config(model_args)
-    if quantization_config is not None:
-        # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
-        model_kwargs["device_map"] = get_kbit_device_map()
-        model_kwargs["quantization_config"] = quantization_config
+    for optimizer_name in optimizers_to_use:
+        print(f"\n{'='*60}")
+        print(f"Starting training with {optimizer_name.upper()} optimizer")
+        print(f"{'='*60}\n")
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        padding_side="left",
-        trust_remote_code=model_args.trust_remote_code,
-    )
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    if tokenizer.chat_template is None:
-        tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
-    value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path,
-        trust_remote_code=model_args.trust_remote_code,
-        num_labels=1,
-    )
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path,
-        trust_remote_code=model_args.trust_remote_code,
-        num_labels=1,
-    )
-    policy = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
-    )
+        # Update output directory for multiple optimizer runs
+        current_output_dir = f"{training_args.output_dir}_{optimizer_name}"
 
-    peft_config = get_peft_config(model_args)
-    if peft_config is None:
-        ref_policy = AutoModelForCausalLM.from_pretrained(
+        ################
+        # Model & Tokenizer
+        ################
+        dtype = (
+            model_args.dtype
+            if model_args.dtype in ["auto", None]
+            else getattr(torch, model_args.dtype)
+        )
+        model_kwargs = dict(
+            revision=model_args.model_revision,
+            attn_implementation=model_args.attn_implementation,
+            dtype=dtype,
+        )
+        quantization_config = get_quantization_config(model_args)
+        if quantization_config is not None:
+            # Passing None would not be treated the same as omitting the argument, so we include it only when valid.
+            model_kwargs["device_map"] = get_kbit_device_map()
+            model_kwargs["quantization_config"] = quantization_config
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+            padding_side="left",
+            trust_remote_code=model_args.trust_remote_code,
+        )
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        if tokenizer.chat_template is None:
+            tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
+        value_model = AutoModelForSequenceClassification.from_pretrained(
+            training_args.reward_model_path,
+            trust_remote_code=model_args.trust_remote_code,
+            num_labels=1,
+        )
+        reward_model = AutoModelForSequenceClassification.from_pretrained(
+            training_args.reward_model_path,
+            trust_remote_code=model_args.trust_remote_code,
+            num_labels=1,
+        )
+        policy = AutoModelForCausalLM.from_pretrained(
             training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
         )
-    else:
-        ref_policy = None
 
-    ################
-    # Dataset
-    ################
-    dataset = load_dataset(
-        script_args.dataset_name,
-        name=script_args.dataset_config,
-        split=script_args.dataset_train_split,
-    )
-    eval_samples = 100
-    train_dataset = dataset.select(range(len(dataset) - eval_samples))
-    eval_dataset = dataset.select(range(len(dataset) - eval_samples, len(dataset)))
-    dataset_text_field = "prompt"
-
-    def prepare_dataset(dataset, tokenizer):
-        """pre-tokenize the dataset before training; only collate during training"""
-
-        def tokenize(element):
-            outputs = tokenizer(
-                element[dataset_text_field],
-                padding=False,
+        peft_config = get_peft_config(model_args)
+        if peft_config is None:
+            ref_policy = AutoModelForCausalLM.from_pretrained(
+                training_args.sft_model_path,
+                trust_remote_code=model_args.trust_remote_code,
             )
-            return {"input_ids": outputs["input_ids"]}
+        else:
+            ref_policy = None
 
-        return dataset.map(
-            tokenize,
-            batched=True,
-            remove_columns=dataset.column_names,
-            num_proc=training_args.dataset_num_proc,
+        ################
+        # Dataset
+        ################
+        dataset = load_dataset(
+            script_args.dataset_name,
+            name=script_args.dataset_config,
+            split=script_args.dataset_train_split,
+        )
+        eval_samples = 100
+        train_dataset = dataset.select(range(len(dataset) - eval_samples))
+        eval_dataset = dataset.select(range(len(dataset) - eval_samples, len(dataset)))
+        dataset_text_field = "prompt"
+
+        def prepare_dataset(dataset, tokenizer):
+            """pre-tokenize the dataset before training; only collate during training"""
+
+            def tokenize(element):
+                outputs = tokenizer(
+                    element[dataset_text_field],
+                    padding=False,
+                )
+                return {"input_ids": outputs["input_ids"]}
+
+            return dataset.map(
+                tokenize,
+                batched=True,
+                remove_columns=dataset.column_names,
+                num_proc=training_args.dataset_num_proc,
+            )
+
+        # Compute that only on the main process for faster data processing.
+        # see: https://github.com/huggingface/trl/pull/1255
+        with PartialState().local_main_process_first():
+            train_dataset = prepare_dataset(train_dataset, tokenizer)
+            eval_dataset = prepare_dataset(eval_dataset, tokenizer)
+
+        ################
+        # Training
+        ################
+
+        # Create optimizer based on selection
+        if optimizer_name == "adam":
+            print(
+                f"Using Adam optimizer with lr={training_args.learning_rate}, "
+                f"betas={tuple(optimizer_args.adam_betas)}, eps={optimizer_args.adam_eps}"
+            )
+            optimizer = torch.optim.Adam(
+                policy.parameters(),
+                lr=training_args.learning_rate,
+                betas=tuple(optimizer_args.adam_betas),
+                eps=optimizer_args.adam_eps,
+            )
+        else:  # sgd
+            print(
+                f"Using SGD optimizer with lr={training_args.learning_rate}, "
+                f"momentum={optimizer_args.momentum}"
+            )
+            optimizer = torch.optim.SGD(
+                policy.parameters(),
+                lr=training_args.learning_rate,
+                momentum=optimizer_args.momentum,
+            )
+
+        scheduler = get_scheduler(
+            name="cosine",
+            optimizer=optimizer,
+            num_warmup_steps=100,
+            num_training_steps=10000,
         )
 
-    # Compute that only on the main process for faster data processing.
-    # see: https://github.com/huggingface/trl/pull/1255
-    with PartialState().local_main_process_first():
-        train_dataset = prepare_dataset(train_dataset, tokenizer)
-        eval_dataset = prepare_dataset(eval_dataset, tokenizer)
+        trainer = PPOTrainer(
+            args=training_args,
+            processing_class=tokenizer,
+            model=policy,
+            ref_model=ref_policy,
+            reward_model=reward_model,
+            value_model=value_model,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            peft_config=peft_config,
+            optimizers=(optimizer, scheduler),
+        )
+        trainer.train()
 
-    ################
-    # Training
-    ################
+        # Save and push to hub
+        trainer.save_model(training_args.output_dir)
+        if training_args.push_to_hub:
+            trainer.push_to_hub(dataset_name=script_args.dataset_name)
 
-    optimizer = torch.optim.Adam(
-        policy.parameters(), lr=1e-5, betas=(0.9, 0.999), eps=1e-8
-    )
+        trainer.generate_completions()
 
-    scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=100,
-        num_training_steps=10000,
-    )
-
-    trainer = PPOTrainer(
-        args=training_args,
-        processing_class=tokenizer,
-        model=policy,
-        ref_model=ref_policy,
-        reward_model=reward_model,
-        value_model=value_model,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        peft_config=peft_config,
-        optimizers=(optimizer, scheduler),
-    )
-    trainer.train()
-
-    # Save and push to hub
-    trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
-
-    trainer.generate_completions()
+        print(f"\nCompleted training with {optimizer_name.upper()} optimizer")
+        print(f"Results saved to {training_args.output_dir}\n")
