@@ -23,6 +23,7 @@
 
 import os
 import shutil
+from xml.parsers.expat import model
 
 import torch
 from accelerate import PartialState
@@ -33,6 +34,7 @@ from transformers import (
     AutoTokenizer,
     HfArgumentParser,
 )
+from transformers import get_scheduler
 
 from trl import (
     ModelConfig,
@@ -91,7 +93,11 @@ if __name__ == "__main__":
     ################
     # Model & Tokenizer
     ################
-    dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
+    dtype = (
+        model_args.dtype
+        if model_args.dtype in ["auto", None]
+        else getattr(torch, model_args.dtype)
+    )
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
@@ -104,16 +110,22 @@ if __name__ == "__main__":
         model_kwargs["quantization_config"] = quantization_config
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, padding_side="left", trust_remote_code=model_args.trust_remote_code
+        model_args.model_name_or_path,
+        padding_side="left",
+        trust_remote_code=model_args.trust_remote_code,
     )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     if tokenizer.chat_template is None:
         tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
     value_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+        training_args.reward_model_path,
+        trust_remote_code=model_args.trust_remote_code,
+        num_labels=1,
     )
     reward_model = AutoModelForSequenceClassification.from_pretrained(
-        training_args.reward_model_path, trust_remote_code=model_args.trust_remote_code, num_labels=1
+        training_args.reward_model_path,
+        trust_remote_code=model_args.trust_remote_code,
+        num_labels=1,
     )
     policy = AutoModelForCausalLM.from_pretrained(
         training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code
@@ -131,7 +143,9 @@ if __name__ == "__main__":
     # Dataset
     ################
     dataset = load_dataset(
-        script_args.dataset_name, name=script_args.dataset_config, split=script_args.dataset_train_split
+        script_args.dataset_name,
+        name=script_args.dataset_config,
+        split=script_args.dataset_train_split,
     )
     eval_samples = 100
     train_dataset = dataset.select(range(len(dataset) - eval_samples))
@@ -164,6 +178,18 @@ if __name__ == "__main__":
     ################
     # Training
     ################
+
+    optimizer = torch.optim.Adam(
+        policy.parameters(), lr=1e-5, betas=(0.9, 0.999), eps=1e-8
+    )
+
+    scheduler = get_scheduler(
+        name="cosine",
+        optimizer=optimizer,
+        num_warmup_steps=100,
+        num_training_steps=10000,
+    )
+
     trainer = PPOTrainer(
         args=training_args,
         processing_class=tokenizer,
@@ -174,6 +200,7 @@ if __name__ == "__main__":
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
+        optimizers=(optimizer, scheduler),
     )
     trainer.train()
 
