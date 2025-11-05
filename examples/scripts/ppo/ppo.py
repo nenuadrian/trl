@@ -51,7 +51,7 @@ from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
-
+os.environ["WANDB_PROJECT"] = "LLM"
 
 """
 python -i examples/scripts/ppo/ppo.py \
