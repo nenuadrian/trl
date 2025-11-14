@@ -52,9 +52,9 @@ os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 wandb.init(
-    project=os.getenv("WANDB_PROJECT", "default"),
+    project=os.getenv("WANDB_PROJECT", "LLM"),
     entity=os.getenv("WANDB_ENTITY", "agent-lab-ppo"),
-    group=os.getenv("WANDB_GROUP", "LLM"),
+    group=os.getenv("WANDB_GROUP", "default"),
 )
 
 
