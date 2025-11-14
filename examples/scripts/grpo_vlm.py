@@ -82,11 +82,15 @@ from trl import (
     get_quantization_config,
 )
 from trl.rewards import accuracy_reward, think_format_reward
-
+import wandb
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
-
+wandb.init(
+    project=os.getenv("WANDB_PROJECT", "LLM"),
+    entity=os.getenv("WANDB_ENTITY", "agent-lab-ppo"),
+    group=os.getenv("WANDB_GROUP", "default"),
+)
 
 if __name__ == "__main__":
     parser = TrlParser((ScriptArguments, GRPOConfig, ModelConfig))
