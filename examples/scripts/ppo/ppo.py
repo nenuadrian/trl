@@ -23,7 +23,6 @@
 
 import os
 import shutil
-from xml.parsers.expat import model
 
 import torch
 from accelerate import PartialState
@@ -35,7 +34,6 @@ from transformers import (
     HfArgumentParser,
 )
 from transformers import get_scheduler
-import argparse
 
 from trl import (
     ModelConfig,
@@ -47,12 +45,18 @@ from trl import (
     get_quantization_config,
 )
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
-
+import wandb
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
-os.environ["WANDB_ENTITY"] = "agent-lab-ppo"
-os.environ["WANDB_PROJECT"] = "LLM"
+
+
+wandb.init(
+    project=os.getenv("WANDB_PROJECT", "default"),
+    entity=os.getenv("WANDB_ENTITY", "agent-lab-ppo"),
+    group=os.getenv("WANDB_GROUP", "LLM"),
+)
+
 
 """
 python -i examples/scripts/ppo/ppo.py \
