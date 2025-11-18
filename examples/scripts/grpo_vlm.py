@@ -98,7 +98,11 @@ if __name__ == "__main__":
     ################
     # Model
     ################
-    dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
+    dtype = (
+        model_args.dtype
+        if model_args.dtype in ["auto", None]
+        else getattr(torch, model_args.dtype)
+    )
     training_args.model_init_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
@@ -113,7 +117,7 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    dataset = load_dataset("lmms-lab/multimodal-open-r1-8k-verified", split="train")
+    dataset = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
     dataset = dataset.train_test_split(test_size=100, seed=42)
 
     SYSTEM_PROMPT = (
