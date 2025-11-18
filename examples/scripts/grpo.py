@@ -117,7 +117,7 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    dataset = load_dataset("lmms-lab/multimodal-open-r1-8k-verified", split="train")
+    dataset = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
     dataset = dataset.train_test_split(test_size=100, seed=42)
 
     SYSTEM_PROMPT = (
@@ -135,22 +135,6 @@ if __name__ == "__main__":
         return {"prompt": prompt}
 
     dataset = dataset.map(make_conversation)
-
-    # Filter have big images
-    def filter_big_images(example):
-        image = example["image"]
-        return image.size[0] < 512 and image.size[1] < 512
-
-    dataset = dataset.filter(filter_big_images)
-
-    def convert_to_rgb(example):
-        image = example["image"]
-        if image.mode != "RGB":
-            image = image.convert("RGB")
-        example["image"] = image
-        return example
-
-    dataset = dataset.map(convert_to_rgb)
 
     train_dataset = dataset["train"]
     eval_dataset = dataset["test"] if training_args.eval_strategy != "no" else None
