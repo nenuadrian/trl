@@ -1749,6 +1749,9 @@ class GRPOTrainer(BaseTrainer):
         elif self.importance_sampling_level == "sequence":
             log_importance_weights = (log_ratio * completion_mask).sum(-1) / completion_mask.sum(-1).clamp(min=1.0)
             log_importance_weights = log_importance_weights.unsqueeze(-1)
+        elif self.importance_sampling_level == "disabled":
+            # all weights are fixed to 1.0
+            log_importance_weights = torch.zeros_like(log_ratio)
         else:
             raise ValueError(
                 f"Unknown importance sampling level: {self.importance_sampling_level}. Possible values are 'token' "
