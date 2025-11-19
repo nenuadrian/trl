@@ -1811,7 +1811,11 @@ class GRPOTrainer(BaseTrainer):
 
         mean_entropy = masked_batch_mean(entropies)
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
-
+        # --- new: mean log-prob "logits" metric for ASPO-style plot
+        mean_logit_like = masked_batch_mean(per_token_logps)
+        gathered_mean_logit = self.accelerator.gather(mean_logit_like)
+        self._metrics[mode]["logits"].append(gathered_mean_logit.nanmean().item())
+        
         # Compute the clipped probability ratios
         is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
         is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
