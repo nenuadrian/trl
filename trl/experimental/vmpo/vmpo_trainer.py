@@ -141,6 +141,11 @@ class VMPOConfig(TrainingArguments):
             Path to the reward model.
         value_clip (`float`, *optional*, defaults to `0.2`):
             Clip range for value targets (±value_clip).
+        beta_entropy (`float`, *optional*, defaults to `0.01`):
+            Entropy regularization coefficient.
+        beta_entropy_decay (`float`, *optional*, defaults to `0.0`):
+            Exponential decay rate k for entropy coefficient: beta_t = beta0 * exp(-k * t). Set 0 to disable.
+
     """
 
     eps_eta: float = field(
@@ -351,6 +356,16 @@ class VMPOConfig(TrainingArguments):
     vf_coef: float = field(
         default=0.1,
         metadata={"help": "Value function coefficient."},
+    )
+    beta_entropy: float = field(
+        default=0.01,
+        metadata={"help": "Entropy regularization coefficient."},
+    )
+    beta_entropy_decay: float = field(
+        default=0.0,
+        metadata={
+            "help": "Exponential decay rate k for entropy coefficient: beta_t = beta0 * exp(-k * t). Set 0 to disable."
+        },
     )
     value_clip: float = field(
         default=0.2,
@@ -1297,9 +1312,9 @@ class VMPOTrainer(BaseTrainer):
             # sequence-level ψ: aggregate advantages per sequence before weighting
             mask_valid = ~padding_mask
             adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1)
+            adv_seq_eta = (adv_seq - adv_seq.mean()) / (adv_seq.std() + 1e-6)
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
-            l_alpha = torch.zeros((), device=device)
             num_seqs = adv_seq.numel()
             if num_seqs > 0:
                 top_k = int(torch.ceil(torch.tensor(num_seqs * args.top_frac)).item())
@@ -1318,7 +1333,7 @@ class VMPOTrainer(BaseTrainer):
                     psi_global = psi_seq[:, None] * mask_valid
                     psi_global = psi_global / (psi_global.sum() + 1e-8)
                     log_mean_exp = torch.logsumexp(
-                        adv_seq[mask_top_seq] / (eta + 1e-8), dim=0
+                        adv_seq_eta[mask_top_seq] / (eta + 1e-8), dim=0
                     ) - torch.log(torch.tensor(float(mask_top_seq.sum()), device=device))
                     l_eta = eta * (args.eps_eta + log_mean_exp)
             self.eta_optimizer.zero_grad()
@@ -1326,9 +1341,6 @@ class VMPOTrainer(BaseTrainer):
                 l_eta.backward(retain_graph=True)
                 self.eta_optimizer.step()
                 l_eta_full_values.append(l_eta.detach())
-            if l_alpha.requires_grad:
-                l_alpha.backward()
-                self.alpha_optimizer.step()
             # detach ψ before policy/value updates to avoid in-place versioning issues
             psi_global = psi_global.detach()
             psi_state = psi_global.sum(dim=1)
@@ -1393,9 +1405,10 @@ class VMPOTrainer(BaseTrainer):
                     entropy = torch.distributions.Categorical(
                         logits=new_logits
                     ).entropy()
-                    entropy_mean = (entropy * mask_valid_mb).sum() / (
-                        mask_valid_mb.sum() + 1e-8
+                    entropy_seq = (entropy * mask_valid_mb).sum(dim=1) / (
+                        mask_valid_mb.sum(dim=1) + 1e-8
                     )
+                    entropy_mean = (psi_state_mb * entropy_seq).sum()
                     # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
                     kl_terms_mb = (
                         logprobs[mini_batch_inds] - new_logprobs
@@ -1405,10 +1418,14 @@ class VMPOTrainer(BaseTrainer):
                     )
                     kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
                     alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
+                    beta_entropy = args.beta_entropy * math.exp(
+                        -args.beta_entropy_decay * (update - 1)
+                    )
                     total_loss = (
                         policy_loss
                         + alpha.detach() * kl_weighted_mb
                         + args.vf_coef * value_loss
+                        - beta_entropy * entropy_mean
                     )
                     self.accelerator.backward(total_loss)
                     optimizer.step()
@@ -1434,12 +1451,9 @@ class VMPOTrainer(BaseTrainer):
             with torch.no_grad():
                 if kl_mb_count > 0:
                     kl_weighted_post = kl_weighted_accum / kl_mb_count
-            if kl_mb_count > 0:
-                self.alpha_optimizer.zero_grad()
-                alpha_post = F.softplus(self.model.alpha_raw) + args.alpha_min
-                l_alpha = -alpha_post * (kl_weighted_post - args.eps_alpha)
-                l_alpha.backward()
-                self.alpha_optimizer.step()
+                else:
+                    kl_weighted_post = torch.zeros((), device=device)
+            # removed redundant post-epoch alpha update
             with torch.no_grad():
                 mean_entropy = entropy_tok
                 rlhf_reward = reward_seq.mean()
@@ -1454,12 +1468,8 @@ class VMPOTrainer(BaseTrainer):
                 )
                 metrics = {}
                 # psi_state already computed above
-                kl_state = kl.sum(dim=1)
-                kl_weighted_states = (psi_state * kl_state).sum()
                 metrics["objective/kl_ref_weighted"] = (
-                    self.accelerator.gather_for_metrics(kl_weighted_states)
-                    .mean()
-                    .item()
+                    self.accelerator.gather_for_metrics(kl_weighted_post).mean().item()
                 )
                 metrics["psi/ess"] = (
                     self.accelerator.gather_for_metrics(psi_ess).mean().item()
