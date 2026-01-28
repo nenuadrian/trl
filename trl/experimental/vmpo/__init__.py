@@ -12,8 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .vmpo_config import VMPOConfig
-from .vmpo_trainer import VMPOTrainer
+from .vmpo_trainer import VMPOTrainer, VMPOConfig
 
 
 __all__ = [
