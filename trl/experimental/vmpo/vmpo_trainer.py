@@ -404,7 +404,7 @@ if is_peft_available():
     from peft import PeftConfig, PeftModel, get_peft_model
 
 
-INVALID_LOGPROB = 1.0
+INVALID_LOGPROB = 0.0
 
 
 def inv_softplus(x: torch.Tensor) -> torch.Tensor:
@@ -1367,140 +1367,8 @@ class VMPOTrainer(BaseTrainer):
                     gradient_accumulation_idx = 0
                     kl_sum_mb = torch.tensor(0.0, device=device)
                     kl_count_mb = torch.tensor(0.0, device=device)
-                    should_step = False
-                    for micro_batch_start in range(
-                        0, args.local_mini_batch_size, args.per_device_train_batch_size
-                    ):
-                        with accelerator.accumulate(model):
-                            micro_batch_end = (
-                                micro_batch_start + args.per_device_train_batch_size
-                            )
-                            micro_batch_inds = mini_batch_inds[
-                                micro_batch_start:micro_batch_end
-                            ]
-                            micro_batch_slice = slice(
-                                micro_batch_start, micro_batch_end
-                            )
-                            mb_advantage = advantages[micro_batch_inds]
-                            mb_responses = responses[micro_batch_inds]
-                            mb_query_responses = query_responses[micro_batch_inds]
-                            mb_logprobs = logprobs[micro_batch_inds]
-                            mb_return = returns[micro_batch_inds]
-                            mb_values = values[micro_batch_inds]
-                            psi = psi_full[micro_batch_slice]
-                            mask_top = mask_top_full[micro_batch_slice]
-
-                            output, vpred_temp = forward(
-                                model, mb_query_responses, processing_class.pad_token_id
-                            )
-                            logits = output.logits[:, context_length - 1 : -1]
-                            new_logprobs = selective_log_softmax(logits, mb_responses)
-                            new_logprobs = torch.masked_fill(
-                                new_logprobs,
-                                padding_mask[micro_batch_inds],
-                                INVALID_LOGPROB,
-                            )
-                            policy_loss = -(
-                                psi[mask_top] * new_logprobs[mask_top]
-                            ).sum()
-
-                            vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
-                            vpred = torch.masked_fill(
-                                vpred, padding_mask_p1[micro_batch_inds], 0
-                            )
-                            vpredclipped = torch.clamp(
-                                vpred,
-                                mb_values - args.cliprange_value,
-                                mb_values + args.cliprange_value,
-                            )
-                            vf_losses1 = torch.square(vpred - mb_return)
-                            vf_losses2 = torch.square(vpredclipped - mb_return)
-                            vf_loss_max = torch.max(vf_losses1, vf_losses2)
-                            vf_loss = 0.5 * masked_mean(
-                                vf_loss_max, ~padding_mask_p1[micro_batch_inds]
-                            )
-                            vf_clipfrac = masked_mean(
-                                (vf_losses2 > vf_losses1).float(),
-                                ~padding_mask_p1[micro_batch_inds],
-                            )
-
-                            # policy_loss now uses per-microbatch normalization
-                            # KL trust region dual (Lα) over all valid tokens
-                            old_logits = rollout_logits[micro_batch_inds]
-                            logp_old = F.log_softmax(old_logits, dim=-1)
-                            logp_new = F.log_softmax(logits, dim=-1)
-                            p_old = logp_old.exp()
-                            kl_token = (p_old * (logp_old - logp_new)).sum(dim=-1)
-                            kl_mask = ~padding_mask[micro_batch_inds]
-                            kl_token = torch.masked_fill(kl_token, ~kl_mask, 0)
-                            kl_sum_mb = kl_sum_mb + kl_token.sum().detach()
-                            kl_count_mb = kl_count_mb + kl_mask.sum().detach()
-                            # Apply the temperature dual once per minibatch (batch-level sparsity control)
-                            loss = (
-                                policy_loss
-                                + args.vf_coef * vf_loss
-                                + l_eta_full / num_microbatches_in_minibatch
-                            )
-                            accelerator.backward(loss)
-                            if accelerator.sync_gradients:
-                                should_step = True
-                            with torch.no_grad():
-                                logprobs_diff = new_logprobs - mb_logprobs
-                                prob_dist = F.softmax(logits, dim=-1)
-                                entropy_token = torch.logsumexp(
-                                    logits, dim=-1
-                                ) - torch.sum(prob_dist * logits, dim=-1)
-                                entropy_token = torch.masked_fill(
-                                    entropy_token, ~kl_mask, 0
-                                )
-                                entropy_mean = entropy_token.sum() / (
-                                    kl_mask.sum() + 1e-8
-                                )
-                                approxkl = torch.masked_fill(
-                                    0.5 * (logprobs_diff**2), ~kl_mask, 0
-                                )
-                                approxkl_mean = approxkl.sum() / (kl_mask.sum() + 1e-8)
-                                approxkl_stats[
-                                    vmpo_epoch_idx,
-                                    minibatch_idx,
-                                    gradient_accumulation_idx,
-                                ] = approxkl_mean
-                                pg_loss_stats[
-                                    vmpo_epoch_idx,
-                                    minibatch_idx,
-                                    gradient_accumulation_idx,
-                                ] = policy_loss
-                                vf_loss_stats[
-                                    vmpo_epoch_idx,
-                                    minibatch_idx,
-                                    gradient_accumulation_idx,
-                                ] = vf_loss
-                                vf_clipfrac_stats[
-                                    vmpo_epoch_idx,
-                                    minibatch_idx,
-                                    gradient_accumulation_idx,
-                                ] = vf_clipfrac
-                                entropy_stats[
-                                    vmpo_epoch_idx,
-                                    minibatch_idx,
-                                    gradient_accumulation_idx,
-                                ] = entropy_mean
-                                kl_old_new_stats[
-                                    vmpo_epoch_idx,
-                                    minibatch_idx,
-                                    gradient_accumulation_idx,
-                                ] = kl_token.sum() / (kl_mask.sum() + 1e-8)
-                        gradient_accumulation_idx += 1
-                    kl_mean_mb = kl_sum_mb / (kl_count_mb + 1e-8)
-                    alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-                    loss_alpha_mb = (
-                        alpha * (args.eps_alpha - kl_mean_mb.detach())
-                        + alpha.detach() * kl_mean_mb
-                    )
-                    accelerator.backward(loss_alpha_mb)
-                    if should_step:
-                        optimizer.step()
-                        optimizer.zero_grad()
+                    optimizer.step()
+                    optimizer.zero_grad()
                     minibatch_idx += 1
                     del (
                         output,
@@ -1524,7 +1392,6 @@ class VMPOTrainer(BaseTrainer):
                         kl_sum_mb,
                         kl_count_mb,
                         kl_mean_mb,
-                        should_step,
                         num_microbatches_in_minibatch,
                     )
                     empty_cache()
