@@ -1330,7 +1330,8 @@ class VMPOTrainer(BaseTrainer):
             if l_alpha.requires_grad:
                 l_alpha.backward()
                 self.alpha_optimizer.step()
-            # derive state weights after ψ is available
+            # detach ψ before policy/value updates to avoid in-place versioning issues
+            psi_global = psi_global.detach()
             psi_state = psi_global.sum(dim=1)
             psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
             # Do multiple epochs of V-MPO training
