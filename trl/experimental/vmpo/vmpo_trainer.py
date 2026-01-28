@@ -872,7 +872,8 @@ class VMPOTrainer(BaseTrainer):
         dual_param_names = {n for n, _ in self.model.named_parameters()}
         assert "eta_raw" in dual_param_names and "alpha_raw" in dual_param_names
         for group in self.optimizer.param_groups:
-            if self.model.eta_raw in group["params"] or self.model.alpha_raw in group["params"]:
+            param_ids = {id(p) for p in group["params"]}
+            if id(self.model.eta_raw) in param_ids or id(self.model.alpha_raw) in param_ids:
                 group["weight_decay"] = 0.0
 
         #########
