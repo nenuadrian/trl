@@ -1439,6 +1439,10 @@ class VMPOTrainer(BaseTrainer):
                     else torch.zeros((), device=device)
                 )
                 metrics = {}
+                psi_state = psi_global.sum(dim=1)
+                psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
+                kl_state = kl.sum(dim=1)
+                kl_weighted_states = (psi_state * kl_state).sum()
                 metrics["objective/kl_ref_weighted"] = (
                     self.accelerator.gather_for_metrics(kl_weighted_states)
                     .mean()
