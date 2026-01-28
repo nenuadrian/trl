@@ -144,7 +144,7 @@ class VMPOConfig(TrainingArguments):
     """
 
     eps_eta: float = field(
-        default=0.1,
+        default=2.0,
         metadata={"help": "Dual variable target εη for the V-MPO temperature loss."},
     )
     eta_init: float = field(
@@ -357,11 +357,11 @@ class VMPOConfig(TrainingArguments):
         metadata={"help": "Clip range for value targets (±value_clip)."},
     )
     gamma: float = field(
-        default=1.0,
+        default=0.99,
         metadata={"help": "Discount factor."},
     )
     lam: float = field(
-        default=0.95,
+        default=0.8,
         metadata={"help": "Lambda value for GAE."},
     )
     ds3_gather_for_generation: bool = field(
@@ -1294,33 +1294,32 @@ class VMPOTrainer(BaseTrainer):
             # Global E-step (compute ψ once per rollout and update η/α)
             eta = F.softplus(self.model.eta_raw) + args.eta_min
             alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-            adv_for_eta = raw_advantages
+            # sequence-level ψ: aggregate advantages per sequence before weighting
             mask_valid = ~padding_mask
+            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1)
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
             l_alpha = torch.zeros((), device=device)
-            adv_valid = adv_for_eta[mask_valid]
-            num_valid = adv_valid.numel()
-            if num_valid > 0:
-                top_k = int(torch.ceil(torch.tensor(num_valid * args.top_frac)).item())
-                mask_top = torch.zeros_like(mask_valid, dtype=torch.bool)
+            num_seqs = adv_seq.numel()
+            if num_seqs > 0:
+                top_k = int(torch.ceil(torch.tensor(num_seqs * args.top_frac)).item())
                 if top_k > 0:
-                    threshold = adv_valid.topk(top_k).values.min()
-                    mask_top = mask_valid & (adv_for_eta >= threshold)
-                    w = torch.zeros_like(adv_for_eta)
-                    max_adv = adv_for_eta[mask_top].max()
-                    w[mask_top] = torch.exp(
-                        (adv_for_eta[mask_top] - max_adv) / (eta + 1e-8)
+                    threshold = adv_seq.topk(top_k).values.min()
+                    mask_top_seq = adv_seq >= threshold
+                    w_seq = torch.zeros_like(adv_seq)
+                    max_adv_seq = adv_seq[mask_top_seq].max()
+                    w_seq[mask_top_seq] = torch.exp(
+                        (adv_seq[mask_top_seq] - max_adv_seq) / (eta + 1e-8)
                     )
-                    w_sum = w.sum()
-                    psi_global = torch.where(
-                        mask_top,
-                        w / (w_sum + 1e-8),
-                        torch.zeros_like(w),
+                    w_sum = w_seq.sum()
+                    psi_seq = torch.where(
+                        mask_top_seq, w_seq / (w_sum + 1e-8), torch.zeros_like(w_seq)
                     )
+                    psi_global = psi_seq[:, None] * mask_valid
+                    psi_global = psi_global / (psi_global.sum() + 1e-8)
                     log_mean_exp = torch.logsumexp(
-                        adv_for_eta[mask_top] / (eta + 1e-8), dim=0
-                    ) - torch.log(torch.tensor(float(mask_top.sum()), device=device))
+                        adv_seq[mask_top_seq] / (eta + 1e-8), dim=0
+                    ) - torch.log(torch.tensor(float(mask_top_seq.sum()), device=device))
                     l_eta = eta * (args.eps_eta + log_mean_exp)
             self.eta_optimizer.zero_grad()
             if l_eta.requires_grad:
@@ -1401,7 +1400,9 @@ class VMPOTrainer(BaseTrainer):
                     kl_terms_mb = (
                         logprobs[mini_batch_inds] - new_logprobs
                     ) * mask_valid_mb
-                    kl_state_mb = kl_terms_mb.sum(dim=1)
+                    kl_state_mb = kl_terms_mb.sum(dim=1) / (
+                        mask_valid_mb.sum(dim=1) + 1e-8
+                    )
                     kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
                     alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
                     total_loss = (
