@@ -1098,6 +1098,7 @@ class VMPOTrainer(BaseTrainer):
             vf_clipfrac_stats.zero_()
             entropy_stats.zero_()
             kl_old_new_stats.zero_()
+            l_eta_full_values: list[torch.Tensor] = []  # track temperature dual terms
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
@@ -1308,9 +1309,11 @@ class VMPOTrainer(BaseTrainer):
                         )
                     eta = F.softplus(self.model.eta_raw) + args.eta_min
                     w_full = torch.zeros_like(mb_advantage_full)
-                    w_full[mask_top_full] = torch.exp(
-                        adv_detach_full[mask_top_full] / (eta + 1e-8)
-                    )
+                    if mask_top_full.any():
+                        max_adv = adv_detach_full[mask_top_full].max()
+                        w_full[mask_top_full] = torch.exp(
+                            (adv_detach_full[mask_top_full] - max_adv) / (eta + 1e-8)
+                        )
                     w_sum_full = w_full.sum()
                     psi_full = (
                         torch.where(
@@ -1338,7 +1341,7 @@ class VMPOTrainer(BaseTrainer):
                         l_eta_full = eta * (args.eps_eta + log_mean_exp)
                     else:
                         l_eta_full = torch.zeros((), device=device)
-
+                    l_eta_full_values.append(l_eta_full.detach())
                     gradient_accumulation_idx = 0
                     for micro_batch_start in range(
                         0, args.local_mini_batch_size, args.per_device_train_batch_size
@@ -1373,6 +1376,13 @@ class VMPOTrainer(BaseTrainer):
                                 padding_mask[micro_batch_inds],
                                 INVALID_LOGPROB,
                             )
+                            # Renormalize ψ within the microbatch to maintain consistent policy loss scaling
+                            psi_selected = psi[mask_top]
+                            psi_selected_sum = psi_selected.sum()
+                            if psi_selected_sum > 0:
+                                psi_selected = psi_selected / (psi_selected_sum + 1e-8)
+                            policy_loss = -(psi_selected * new_logprobs[mask_top]).sum()
+
                             vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                             vpred = torch.masked_fill(
                                 vpred, padding_mask_p1[micro_batch_inds], 0
@@ -1393,10 +1403,7 @@ class VMPOTrainer(BaseTrainer):
                                 ~padding_mask_p1[micro_batch_inds],
                             )
 
-                            policy_loss = -(
-                                psi[mask_top] * new_logprobs[mask_top]
-                            ).sum()  # zero if no selected tokens
-
+                            # policy_loss now uses per-microbatch normalization
                             # KL trust region dual (Lα) over all valid tokens
                             old_logits = rollout_logits[micro_batch_inds]
                             logp_old = F.log_softmax(old_logits, dim=-1)
@@ -1412,21 +1419,7 @@ class VMPOTrainer(BaseTrainer):
                                 + alpha.detach() * kl_mean
                             )
 
-                            # Temperature dual (Lη) on selected tokens
-                            if mask_top.any():
-                                adv_sel = mb_advantage.detach()[mask_top]
-                                log_mean_exp = torch.logsumexp(
-                                    adv_sel / (eta + 1e-8), dim=0
-                                ) - torch.log(
-                                    torch.tensor(
-                                        float(adv_sel.numel()), device=adv_sel.device
-                                    )
-                                )
-                                l_eta = eta * (args.eps_eta + log_mean_exp)
-                            else:
-                                l_eta = torch.zeros((), device=mb_advantage.device)
-
-                            # Total V-MPO loss
+                            # Apply the temperature dual once per minibatch (batch-level sparsity control)
                             loss = (
                                 policy_loss
                                 + args.vf_coef * vf_loss
@@ -1528,9 +1521,14 @@ class VMPOTrainer(BaseTrainer):
                 mean_entropy = (-logprobs).sum(1).mean()
                 mean_non_score_reward = non_score_reward.sum(1).mean()
                 rlhf_reward = mean_non_score_reward + scores.mean()
-                eps = int(self.state.episode / (time.time() - start_time))
+                eta_value = F.softplus(self.model.eta_raw) + args.eta_min
+                l_eta_mean = (
+                    torch.stack(l_eta_full_values).mean()
+                    if len(l_eta_full_values) > 0
+                    else torch.zeros((), device=device)
+                )
                 metrics = {}
-                metrics["eps"] = eps
+                metrics["eps"] = int(self.state.episode / (time.time() - start_time))
                 metrics["objective/kl_ref"] = (
                     self.accelerator.gather_for_metrics(mean_kl).mean().item()
                 )
@@ -1565,6 +1563,12 @@ class VMPOTrainer(BaseTrainer):
                 )
                 metrics["policy/entropy_avg"] = (
                     self.accelerator.gather_for_metrics(entropy_stats).mean().item()
+                )
+                metrics["dual/eta_value"] = (
+                    self.accelerator.gather_for_metrics(eta_value).mean().item()
+                )
+                metrics["dual/l_eta_mean"] = (
+                    self.accelerator.gather_for_metrics(l_eta_mean).mean().item()
                 )
                 metrics["val/num_eos_tokens"] = (
                     (responses == processing_class.eos_token_id).sum().item()
