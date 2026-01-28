@@ -1330,6 +1330,9 @@ class VMPOTrainer(BaseTrainer):
             if l_alpha.requires_grad:
                 l_alpha.backward()
                 self.alpha_optimizer.step()
+            # derive state weights after ψ is available
+            psi_state = psi_global.sum(dim=1)
+            psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
             # Do multiple epochs of V-MPO training
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
@@ -1439,8 +1442,7 @@ class VMPOTrainer(BaseTrainer):
                     else torch.zeros((), device=device)
                 )
                 metrics = {}
-                psi_state = psi_global.sum(dim=1)
-                psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
+                # psi_state already computed above
                 kl_state = kl.sum(dim=1)
                 kl_weighted_states = (psi_state * kl_state).sum()
                 metrics["objective/kl_ref_weighted"] = (
