@@ -250,6 +250,12 @@ class VMPOConfig(TrainingArguments):
             "a positive value."
         },
     )
+    eos_bonus: float = field(
+        default=0.1,
+        metadata={
+            "help": "Optional positive shaping reward added at the EOS position."
+        },
+    )
     sft_model_path: str = field(
         default="EleutherAI/pythia-160m",
         metadata={"help": "Path to the SFT model."},
@@ -313,10 +319,6 @@ class VMPOConfig(TrainingArguments):
             "help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."
         },
     )
-    num_vmpo_epochs: int = field(
-        default=1,
-        metadata={"help": "Number of epochs to train."},
-    )
     whiten_rewards: bool = field(
         default=False,
         metadata={"help": "Whether to whiten the rewards."},
@@ -362,19 +364,12 @@ class VMPOConfig(TrainingArguments):
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
-
-        # Transformers explicitly set use_reentrant=True in the past to silence a PyTorch warning, but the default was
-        # never updated once PyTorch switched to recommending use_reentrant=False. Until that change lands upstream
-        # (see https://github.com/huggingface/transformers/pull/43203) and is released (most likely in 5.0.0), we
-        # default to the recommended non-reentrant behavior here, while preserving any user-provided value.
-        if self.gradient_checkpointing and Version(transformers.__version__) < Version(
-            "5.0.0"
-        ):
-            self.gradient_checkpointing_kwargs = (
-                self.gradient_checkpointing_kwargs or {}
+        if self.missing_eos_penalty is not None and self.missing_eos_penalty <= 0:
+            raise ValueError(
+                "`missing_eos_penalty` must be > 0 to enable EOS penalization."
             )
-            self.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
-
+        if self.eos_bonus < 0:
+            raise ValueError("`eos_bonus` must be non-negative.")
         super().__post_init__()
 
 
@@ -1030,7 +1025,6 @@ class VMPOTrainer(BaseTrainer):
 
         accelerator.print("===training policy===")
         stats_shape = (
-            args.num_vmpo_epochs,
             args.num_mini_batches,
             args.gradient_accumulation_steps,
         )
@@ -1089,6 +1083,7 @@ class VMPOTrainer(BaseTrainer):
                 context_length = queries.shape[1]
                 responses = []
                 postprocessed_responses = []
+                contain_eos_token_raw = []
                 logprobs = []
                 ref_logprobs = []
                 scores = []
@@ -1117,6 +1112,7 @@ class VMPOTrainer(BaseTrainer):
                         i : i + args.local_rollout_forward_batch_size
                     ]
                     response = query_response[:, context_length:]
+                    contain_eos_token_raw.append((response == eos_id).any(dim=1))
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     logprob = selective_log_softmax(logits, response)
                     rollout_logits.append(logits)
@@ -1152,11 +1148,14 @@ class VMPOTrainer(BaseTrainer):
                     postprocessed_query_response = torch.cat(
                         (query, postprocessed_response), 1
                     )
-                    sequence_length = (
-                        first_true_indices(
-                            postprocessed_response == processing_class.pad_token_id
-                        )
-                        - 1
+                    pad_mask = postprocessed_response == processing_class.pad_token_id
+                    has_pad = pad_mask.any(dim=1)
+                    pad_idx = first_true_indices(pad_mask)
+
+                    sequence_length = torch.where(
+                        has_pad,
+                        pad_idx - 1,
+                        torch.full_like(pad_idx, postprocessed_response.shape[1] - 1),
                     )
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
@@ -1182,6 +1181,7 @@ class VMPOTrainer(BaseTrainer):
                     values.append(value)
                 responses = torch.cat(responses, 0)
                 postprocessed_responses = torch.cat(postprocessed_responses, 0)
+                contain_eos_token_raw = torch.cat(contain_eos_token_raw, 0)
                 logprobs = torch.cat(logprobs, 0)
                 ref_logprobs = torch.cat(ref_logprobs, 0)
                 sequence_lengths = torch.cat(sequence_lengths, 0)
@@ -1194,10 +1194,10 @@ class VMPOTrainer(BaseTrainer):
 
                 # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
                 # Completions not passing that filter will receive a lower score.
-                contain_eos_token = (postprocessed_responses == eos_id).any(dim=1)
+                contain_eos_token_post = (postprocessed_responses == eos_id).any(dim=1)
                 if self.args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token] -= self.args.missing_eos_penalty
-                # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
+                    scores[~contain_eos_token_post] -= self.args.missing_eos_penalty
+                # accelerator.print(f"{scores=}, {(contain_eos_token_post.sum() / len(contain_eos_token_post))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
                 response_idxs = torch.arange(
@@ -1233,6 +1233,15 @@ class VMPOTrainer(BaseTrainer):
                     sequence_lengths,
                 )
                 rewards[actual_start, actual_end] += scores
+                if args.eos_bonus > 0:
+                    eos_positions = first_true_indices(
+                        postprocessed_responses == eos_id
+                    )
+                    has_eos = contain_eos_token_post
+                    batch_idx = torch.arange(rewards.size(0), device=rewards.device)[
+                        has_eos
+                    ]
+                    rewards[batch_idx, eos_positions[has_eos]] += args.eos_bonus
                 # logging masks/summaries
                 reward_valid_mask = ~padding_mask_p1
                 reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
@@ -1252,20 +1261,22 @@ class VMPOTrainer(BaseTrainer):
                 for t in reversed(range(gen_length)):
                     nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
                     delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
-                    lastgaelam = delta + args.gamma * args.lam * lastgaelam
+                    not_done = ~padding_mask_p1[:, t]
+                    lastgaelam = delta + args.gamma * args.lam * lastgaelam * not_done
                     advantages_reversed.append(lastgaelam)
                 raw_advantages = torch.stack(advantages_reversed[::-1], axis=1)
                 returns = raw_advantages + values
-                advantages = raw_advantages  # keep raw scale for policy/dual alignment
                 empty_cache()
 
             # Global E-step (compute ψ once per rollout and update η/α)
             eta = F.softplus(self.model.eta_raw) + args.eta_min
             alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
             # sequence-level ψ: aggregate advantages per sequence before weighting
-            mask_valid = ~padding_mask
+            mask_valid = ~padding_mask_p1
             valid_len = mask_valid.sum(dim=1).clamp_min(1)
-            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1) / valid_len
+            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(
+                dim=1
+            ) / valid_len
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
             num_seqs = adv_seq.numel()
@@ -1287,96 +1298,87 @@ class VMPOTrainer(BaseTrainer):
             psi_global = psi_global.detach()
             psi_state = psi_global.sum(dim=1)
             psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
-            # Do multiple epochs of V-MPO training
+            # Do V-MPO training in a single pass
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
-            for vmpo_epoch_idx in range(args.num_vmpo_epochs):
-                b_inds = np.random.permutation(args.local_batch_size)
-                minibatch_idx = 0
-                for mini_batch_start in range(
-                    0, args.local_batch_size, args.local_mini_batch_size
-                ):
-                    mini_batch_end = mini_batch_start + args.local_mini_batch_size
-                    mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
+            b_inds = np.random.permutation(args.local_batch_size)
+            minibatch_idx = 0
+            for mini_batch_start in range(
+                0, args.local_batch_size, args.local_mini_batch_size
+            ):
+                mini_batch_end = mini_batch_start + args.local_mini_batch_size
+                mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
 
-                    mb_query = queries[mini_batch_inds]
-                    mb_response = responses[mini_batch_inds]
-                    mb_query_response = torch.cat((mb_query, mb_response), 1)
-                    psi_mb = psi_global[mini_batch_inds]
-                    psi_state_mb = psi_state[mini_batch_inds]
-                    mask_valid_mb = ~padding_mask[mini_batch_inds]
+                mb_query = queries[mini_batch_inds]
+                mb_response = responses[mini_batch_inds]
+                mb_query_response = torch.cat((mb_query, mb_response), 1)
+                psi_mb = psi_global[mini_batch_inds]
+                psi_state_mb = psi_state[mini_batch_inds]
+                mask_valid_mb = ~padding_mask_p1[mini_batch_inds]
 
-                    policy_outputs = forward(
-                        model.policy,
-                        mb_query_response,
-                        processing_class.pad_token_id,
-                    )
-                    new_logits = policy_outputs.logits[:, context_length - 1 : -1]
-                    new_logprobs = selective_log_softmax(new_logits, mb_response)
+                policy_outputs = forward(
+                    model.policy,
+                    mb_query_response,
+                    processing_class.pad_token_id,
+                )
+                new_logits = policy_outputs.logits[:, context_length - 1 : -1]
+                new_logprobs = selective_log_softmax(new_logits, mb_response)
 
-                    if psi_mb.sum() > 0:
-                        policy_loss = -(
-                            (psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8)
-                        )
-                    else:
-                        policy_loss = torch.zeros((), device=device)
+                if psi_mb.sum() > 0:
+                    policy_loss = -(
+                        (psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8)
+                    )
+                else:
+                    policy_loss = torch.zeros((), device=device)
 
-                    value_full, _, _ = get_reward(
-                        self.accelerator.unwrap_model(model).value_model,
-                        mb_query_response,
-                        processing_class.pad_token_id,
-                        context_length,
+                value_full, _, _ = get_reward(
+                    self.accelerator.unwrap_model(model).value_model,
+                    mb_query_response,
+                    processing_class.pad_token_id,
+                    context_length,
+                )
+                value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
+                value_mask = ~padding_mask_p1[mini_batch_inds]
+                with torch.no_grad():
+                    value_old_mb = values[mini_batch_inds]
+                    returns_mb = returns[mini_batch_inds]
+                    delta = (returns_mb - value_old_mb).clamp(
+                        -args.value_clip, args.value_clip
                     )
-                    value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
-                    value_mask = ~padding_mask_p1[mini_batch_inds]
-                    with torch.no_grad():
-                        value_old_mb = values[mini_batch_inds]
-                        returns_mb = returns[mini_batch_inds]
-                        delta = (returns_mb - value_old_mb).clamp(
-                            -args.value_clip, args.value_clip
-                        )
-                        value_target = value_old_mb + delta
-                    if value_mask.any():
-                        value_loss = F.mse_loss(
-                            value_pred[value_mask],
-                            value_target[value_mask],
-                        )
-                    else:
-                        value_loss = torch.zeros((), device=device)
+                    value_target = value_old_mb + delta
+                if value_mask.any():
+                    value_loss = F.mse_loss(
+                        value_pred[value_mask],
+                        value_target[value_mask],
+                    )
+                else:
+                    value_loss = torch.zeros((), device=device)
 
-                    # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
-                    kl_terms_mb = (
-                        logprobs[mini_batch_inds] - new_logprobs
-                    ) * mask_valid_mb
-                    kl_state_mb = kl_terms_mb.sum(dim=1) / (
-                        mask_valid_mb.sum(dim=1) + 1e-8
-                    )
-                    kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
-                    alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-                    total_loss = (
-                        policy_loss
-                        + alpha.detach() * kl_weighted_mb
-                        + args.vf_coef * value_loss
-                    )
-                    self.accelerator.backward(total_loss)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    kl_weighted_accum += kl_weighted_mb.detach()
-                    kl_mb_count += 1
-                    self.alpha_optimizer.zero_grad()
-                    l_alpha_mb = -alpha * (kl_weighted_mb.detach() - args.eps_alpha)
-                    l_alpha_mb.backward()
-                    self.alpha_optimizer.step()
-                    pg_loss_stats[vmpo_epoch_idx, minibatch_idx] = policy_loss.detach()
-                    vf_loss_stats[vmpo_epoch_idx, minibatch_idx] = value_loss.detach()
-                    approxkl_stats[vmpo_epoch_idx, minibatch_idx] = (
-                        kl_weighted_mb.detach()
-                    )
-                    vf_clipfrac_stats[vmpo_epoch_idx, minibatch_idx] = torch.zeros(
-                        (), device=device
-                    )
-                    minibatch_idx += 1
-                    empty_cache()
+                # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
+                kl_terms_mb = (logprobs[mini_batch_inds] - new_logprobs) * mask_valid_mb
+                kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
+                kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
+                alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
+                total_loss = (
+                    policy_loss
+                    + alpha.detach() * kl_weighted_mb
+                    + args.vf_coef * value_loss
+                )
+                self.accelerator.backward(total_loss)
+                optimizer.step()
+                optimizer.zero_grad()
+                kl_weighted_accum += kl_weighted_mb.detach()
+                kl_mb_count += 1
+                self.alpha_optimizer.zero_grad()
+                l_alpha_mb = -alpha * (kl_weighted_mb.detach() - args.eps_alpha)
+                l_alpha_mb.backward()
+                self.alpha_optimizer.step()
+                pg_loss_stats[minibatch_idx] = policy_loss.detach()
+                vf_loss_stats[minibatch_idx] = value_loss.detach()
+                approxkl_stats[minibatch_idx] = kl_weighted_mb.detach()
+                vf_clipfrac_stats[minibatch_idx] = torch.zeros((), device=device)
+                minibatch_idx += 1
+                empty_cache()
             # removed delayed α update; trust region is enforced per minibatch
             with torch.no_grad():
                 if kl_mb_count > 0:
@@ -1442,7 +1444,8 @@ class VMPOTrainer(BaseTrainer):
                 metrics["dual/l_eta_mean"] = (
                     self.accelerator.gather_for_metrics(l_eta_mean).mean().item()
                 )
-                metrics["val/num_eos_tokens"] = contain_eos_token.sum().item()
+                metrics["val/num_eos_tokens_raw"] = contain_eos_token_raw.sum().item()
+                metrics["val/num_eos_tokens"] = contain_eos_token_post.sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
                 self.state.epoch = (
@@ -1482,16 +1485,8 @@ class VMPOTrainer(BaseTrainer):
                 ref_logprobs,
                 values,
                 sequence_lengths,
-                contain_eos_token,
-                sequence_lengths_p1,
-                response_idxs,
-                padding_mask,
-                padding_mask_p1,
-                rewards,
-                actual_start,
-                actual_end,
-                advantages,
-                returns,
+                contain_eos_token_post,
+                contain_eos_token_raw,
                 rollout_logits,
             )
             empty_cache()
