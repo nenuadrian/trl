@@ -1436,7 +1436,8 @@ class VMPOTrainer(BaseTrainer):
                     kl_weighted_post = kl_weighted_accum / kl_mb_count
             if kl_mb_count > 0:
                 self.alpha_optimizer.zero_grad()
-                l_alpha = -alpha * (kl_weighted_post - args.eps_alpha)
+                alpha_post = F.softplus(self.model.alpha_raw) + args.alpha_min
+                l_alpha = -alpha_post * (kl_weighted_post - args.eps_alpha)
                 l_alpha.backward()
                 self.alpha_optimizer.step()
             with torch.no_grad():
