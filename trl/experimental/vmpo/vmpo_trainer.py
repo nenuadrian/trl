@@ -1135,7 +1135,7 @@ class VMPOTrainer(BaseTrainer):
                     response = query_response[:, context_length:]
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     logprob = selective_log_softmax(logits, response)
-                    rollout_logits.append(logits / (args.temperature + 1e-7))
+                    rollout_logits.append(logits)
                     del logits
                     empty_cache()
 
