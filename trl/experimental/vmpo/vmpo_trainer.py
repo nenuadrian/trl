@@ -156,7 +156,7 @@ class VMPOConfig(TrainingArguments):
         metadata={"help": "Minimum value added after softplus to keep η positive."},
     )
     top_frac: float = field(
-        default=0.5,
+        default=0.1,
         metadata={
             "help": "Fraction of valid token advantages to keep for V-MPO weighting (top fraction by advantage)."
         },
@@ -871,7 +871,7 @@ class VMPOTrainer(BaseTrainer):
         self.optimizer.param_groups = [
             g for g in self.optimizer.param_groups if len(g["params"]) > 0
         ]
-        eta_lr = self.args.learning_rate * 0.1
+        eta_lr = self.args.learning_rate * 1.0
         alpha_lr = self.args.learning_rate
         self.eta_optimizer = torch.optim.Adam(
             [self.model.eta_raw],
@@ -1294,23 +1294,23 @@ class VMPOTrainer(BaseTrainer):
             # Global E-step (compute ψ once per rollout and update η/α)
             eta = F.softplus(self.model.eta_raw) + args.eta_min
             alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-            adv_detach = raw_advantages.detach()
+            adv_for_eta = raw_advantages
             mask_valid = ~padding_mask
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
             l_alpha = torch.zeros((), device=device)
-            adv_valid = adv_detach[mask_valid]
+            adv_valid = adv_for_eta[mask_valid]
             num_valid = adv_valid.numel()
             if num_valid > 0:
                 top_k = int(torch.ceil(torch.tensor(num_valid * args.top_frac)).item())
                 mask_top = torch.zeros_like(mask_valid, dtype=torch.bool)
                 if top_k > 0:
                     threshold = adv_valid.topk(top_k).values.min()
-                    mask_top = mask_valid & (adv_detach >= threshold)
-                    w = torch.zeros_like(adv_detach)
-                    max_adv = adv_detach[mask_top].max()
+                    mask_top = mask_valid & (adv_for_eta >= threshold)
+                    w = torch.zeros_like(adv_for_eta)
+                    max_adv = adv_for_eta[mask_top].max()
                     w[mask_top] = torch.exp(
-                        (adv_detach[mask_top] - max_adv) / (eta + 1e-8)
+                        (adv_for_eta[mask_top] - max_adv) / (eta + 1e-8)
                     )
                     w_sum = w.sum()
                     psi_global = torch.where(
@@ -1319,7 +1319,7 @@ class VMPOTrainer(BaseTrainer):
                         torch.zeros_like(w),
                     )
                     log_mean_exp = torch.logsumexp(
-                        adv_detach[mask_top] / (eta + 1e-8), dim=0
+                        adv_for_eta[mask_top] / (eta + 1e-8), dim=0
                     ) - torch.log(torch.tensor(float(mask_top.sum()), device=device))
                     l_eta = eta * (args.eps_eta + log_mean_exp)
             self.eta_optimizer.zero_grad()
@@ -1403,6 +1403,7 @@ class VMPOTrainer(BaseTrainer):
                     ) * mask_valid_mb
                     kl_state_mb = kl_terms_mb.sum(dim=1)
                     kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
+                    alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
                     total_loss = (
                         policy_loss
                         + alpha.detach() * kl_weighted_mb
@@ -1413,6 +1414,10 @@ class VMPOTrainer(BaseTrainer):
                     optimizer.zero_grad()
                     kl_weighted_accum += kl_weighted_mb.detach()
                     kl_mb_count += 1
+                    self.alpha_optimizer.zero_grad()
+                    l_alpha_mb = -alpha * (kl_weighted_mb.detach() - args.eps_alpha)
+                    l_alpha_mb.backward()
+                    self.alpha_optimizer.step()
                     pg_loss_stats[vmpo_epoch_idx, minibatch_idx] = policy_loss.detach()
                     vf_loss_stats[vmpo_epoch_idx, minibatch_idx] = value_loss.detach()
                     approxkl_stats[vmpo_epoch_idx, minibatch_idx] = (
@@ -1424,6 +1429,7 @@ class VMPOTrainer(BaseTrainer):
                     )
                     minibatch_idx += 1
                     empty_cache()
+            # removed delayed α update; trust region is enforced per minibatch
             with torch.no_grad():
                 if kl_mb_count > 0:
                     kl_weighted_post = kl_weighted_accum / kl_mb_count
@@ -1492,6 +1498,7 @@ class VMPOTrainer(BaseTrainer):
                 metrics["policy/entropy_avg"] = (
                     self.accelerator.gather_for_metrics(entropy_stats).mean().item()
                 )
+                metrics["dual/eta_grad_norm"] = self.model.eta_raw.grad.norm()
                 metrics["dual/eta_value"] = (
                     self.accelerator.gather_for_metrics(eta_value).mean().item()
                 )
