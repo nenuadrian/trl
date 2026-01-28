@@ -1236,10 +1236,10 @@ class VMPOTrainer(BaseTrainer):
 
                 # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
                 # Completions not passing that filter will receive a lower score.
-                contain_eos_token = torch.any(
-                    postprocessed_responses == self.processing_class.eos_token_id,
-                    dim=-1,
-                )
+                generated_len = (
+                    postprocessed_responses != processing_class.pad_token_id
+                ).sum(dim=1)
+                contain_eos_token = generated_len < args.response_length
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
@@ -1336,7 +1336,9 @@ class VMPOTrainer(BaseTrainer):
                     psi_global = psi_global / (psi_global.sum() + 1e-8)
                     log_mean_exp = torch.logsumexp(
                         adv_seq_eta[mask_top_seq] / (eta + 1e-8), dim=0
-                    ) - torch.log(torch.tensor(float(mask_top_seq.sum()), device=device))
+                    ) - torch.log(
+                        torch.tensor(float(mask_top_seq.sum()), device=device)
+                    )
                     l_eta = eta * (args.eps_eta + log_mean_exp)
             self.eta_optimizer.zero_grad()
             if l_eta.requires_grad:
@@ -1468,6 +1470,8 @@ class VMPOTrainer(BaseTrainer):
                     if len(l_eta_full_values) > 0
                     else torch.zeros((), device=device)
                 )
+                eta_grad = self.model.eta_raw.grad
+                eta_grad_norm = eta_grad.norm().item() if eta_grad is not None else 0.0
                 metrics = {}
                 # psi_state already computed above
                 metrics["objective/kl_ref_weighted"] = (
@@ -1512,7 +1516,7 @@ class VMPOTrainer(BaseTrainer):
                 metrics["policy/entropy_avg"] = (
                     self.accelerator.gather_for_metrics(entropy_stats).mean().item()
                 )
-                metrics["dual/eta_grad_norm"] = self.model.eta_raw.grad.norm()
+                metrics["dual/eta_grad_norm"] = eta_grad_norm
                 metrics["dual/eta_value"] = (
                     self.accelerator.gather_for_metrics(eta_value).mean().item()
                 )
@@ -1522,9 +1526,7 @@ class VMPOTrainer(BaseTrainer):
                 metrics["dual/l_eta_mean"] = (
                     self.accelerator.gather_for_metrics(l_eta_mean).mean().item()
                 )
-                metrics["val/num_eos_tokens"] = (
-                    (responses == processing_class.eos_token_id).sum().item()
-                )
+                metrics["val/num_eos_tokens"] = contain_eos_token.sum().item()
                 metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
                 metrics["episode"] = self.state.episode
                 self.state.epoch = (
