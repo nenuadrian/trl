@@ -1001,7 +1001,8 @@ class VMPOTrainer(BaseTrainer):
         args = self.args
         processing_class = self.processing_class
         dataloader = self.dataloader
-        device = self.accelerator.device
+        accelerator = self.accelerator
+        device = accelerator.device
 
         def repeat_generator():
             while True:
@@ -1260,35 +1261,19 @@ class VMPOTrainer(BaseTrainer):
             # sequence-level ψ: aggregate advantages per sequence before weighting
             mask_valid = ~padding_mask
             valid_len = mask_valid.sum(dim=1).clamp_min(1)
-            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(
-                dim=1
-            ) / valid_len
-            adv_seq_eta = adv_seq
+            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1) / valid_len
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
             num_seqs = adv_seq.numel()
             if num_seqs > 0:
-                top_k = int(torch.ceil(torch.tensor(num_seqs * args.top_frac)).item())
-                if top_k > 0:
-                    threshold = adv_seq.topk(top_k).values.min()
-                    mask_top_seq = adv_seq >= threshold
-                    w_seq = torch.zeros_like(adv_seq)
-                    max_adv_seq = adv_seq[mask_top_seq].max()
-                    w_seq[mask_top_seq] = torch.exp(
-                        (adv_seq[mask_top_seq] - max_adv_seq) / (eta + 1e-8)
-                    )
-                    w_sum = w_seq.sum()
-                    psi_seq = torch.where(
-                        mask_top_seq, w_seq / (w_sum + 1e-8), torch.zeros_like(w_seq)
-                    )
-                    psi_seq = psi_seq / psi_seq.sum().clamp_min(1e-8)
-                    psi_global = psi_seq[:, None] * mask_valid
-                    log_mean_exp = torch.logsumexp(
-                        adv_seq_eta[mask_top_seq] / (eta + 1e-8), dim=0
-                    ) - torch.log(
-                        torch.tensor(float(mask_top_seq.sum()), device=device)
-                    )
-                    l_eta = eta * (args.eps_eta + log_mean_exp)
+                max_adv = adv_seq.max()
+                w_seq = torch.exp((adv_seq - max_adv) / (eta + 1e-8))
+                psi_seq = w_seq / w_seq.sum().clamp_min(1e-8)
+                psi_global = psi_seq[:, None] * mask_valid
+                log_mean_exp = torch.logsumexp(
+                    adv_seq / (eta + 1e-8), dim=0
+                ) - math.log(num_seqs)
+                l_eta = eta * (args.eps_eta + log_mean_exp)
             self.eta_optimizer.zero_grad()
             if l_eta.requires_grad:
                 l_eta.backward(retain_graph=True)
