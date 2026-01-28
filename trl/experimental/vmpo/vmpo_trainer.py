@@ -1314,7 +1314,7 @@ class VMPOTrainer(BaseTrainer):
             # sequence-level ψ: aggregate advantages per sequence before weighting
             mask_valid = ~padding_mask
             adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1)
-            adv_seq_eta = (adv_seq - adv_seq.mean()) / (adv_seq.std() + 1e-6)
+            adv_seq_eta = adv_seq
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
             num_seqs = adv_seq.numel()
