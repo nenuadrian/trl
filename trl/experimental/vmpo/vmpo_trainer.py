@@ -1427,10 +1427,12 @@ class VMPOTrainer(BaseTrainer):
             with torch.no_grad():
                 if kl_mb_count > 0:
                     kl_weighted_post = kl_weighted_accum / kl_mb_count
-                    self.alpha_optimizer.zero_grad()
-                    l_alpha = -alpha * (kl_weighted_post - args.eps_alpha)
-                    l_alpha.backward()
-                    self.alpha_optimizer.step()
+            if kl_mb_count > 0:
+                self.alpha_optimizer.zero_grad()
+                l_alpha = -alpha * (kl_weighted_post - args.eps_alpha)
+                l_alpha.backward()
+                self.alpha_optimizer.step()
+            with torch.no_grad():
                 mean_entropy = entropy_tok
                 rlhf_reward = reward_seq.mean()
                 eta_value = F.softplus(self.model.eta_raw) + args.eta_min
