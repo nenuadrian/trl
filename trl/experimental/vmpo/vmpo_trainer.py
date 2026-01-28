@@ -1,17 +1,3 @@
-# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 import gc
 import math
 import os
@@ -1236,10 +1222,9 @@ class VMPOTrainer(BaseTrainer):
 
                 # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
                 # Completions not passing that filter will receive a lower score.
-                generated_len = (
-                    postprocessed_responses != processing_class.pad_token_id
-                ).sum(dim=1)
-                contain_eos_token = generated_len < args.response_length
+                contain_eos_token = (
+                    postprocessed_responses == processing_class.eos_token_id
+                ).any(dim=1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
@@ -1332,8 +1317,8 @@ class VMPOTrainer(BaseTrainer):
                     psi_seq = torch.where(
                         mask_top_seq, w_seq / (w_sum + 1e-8), torch.zeros_like(w_seq)
                     )
+                    psi_seq = psi_seq / psi_seq.sum().clamp_min(1e-8)
                     psi_global = psi_seq[:, None] * mask_valid
-                    psi_global = psi_global / (psi_global.sum() + 1e-8)
                     log_mean_exp = torch.logsumexp(
                         adv_seq_eta[mask_top_seq] / (eta + 1e-8), dim=0
                     ) - torch.log(
@@ -1501,6 +1486,7 @@ class VMPOTrainer(BaseTrainer):
                 metrics["objective/rlhf_reward"] = (
                     self.accelerator.gather_for_metrics(rlhf_reward).mean().item()
                 )
+                metrics["debug/reward_std"] = scores.std().item()
                 metrics["policy/approxkl_avg"] = (
                     self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
                 )
