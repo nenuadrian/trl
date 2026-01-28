@@ -1256,6 +1256,18 @@ class VMPOTrainer(BaseTrainer):
                     sequence_lengths,
                 )
                 rewards[actual_start, actual_end] += scores
+                # logging masks/summaries
+                valid_tok_mask = ~padding_mask
+                valid_tok_count = valid_tok_mask.sum(1)
+                kl_seq = kl.masked_fill(padding_mask, 0).sum(1)
+                kl_tok = kl_seq.sum() / (valid_tok_count.sum() + 1e-8)
+                entropy_seq = -(logprobs.masked_fill(padding_mask, 0)).sum(1)
+                entropy_tok = entropy_seq.sum() / (valid_tok_count.sum() + 1e-8)
+                non_score_seq = non_score_reward.masked_fill(padding_mask, 0).sum(1)
+                non_score_tok = non_score_seq.sum() / (valid_tok_count.sum() + 1e-8)
+                reward_valid_mask = ~padding_mask_p1
+                reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
+                reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
 
                 # 5. whiten rewards
                 if args.whiten_rewards:
@@ -1517,12 +1529,10 @@ class VMPOTrainer(BaseTrainer):
                     )
                     empty_cache()
             with torch.no_grad():
-                mean_kl = kl.sum(1).mean()
-                mean_entropy = -(logprobs * (~padding_mask)).sum() / (
-                    (~padding_mask).sum() + 1e-8
-                )
-                mean_non_score_reward = non_score_reward.sum(1).mean()
-                rlhf_reward = mean_non_score_reward + scores.mean()
+                mean_kl = kl_seq.mean()
+                mean_entropy = entropy_tok
+                mean_non_score_reward = non_score_seq.mean()
+                rlhf_reward = reward_seq.mean()
                 eta_value = F.softplus(self.model.eta_raw) + args.eta_min
                 l_eta_mean = (
                     torch.stack(l_eta_full_values).mean()
@@ -1530,26 +1540,43 @@ class VMPOTrainer(BaseTrainer):
                     else torch.zeros((), device=device)
                 )
                 metrics = {}
-                metrics["eps"] = int(self.state.episode / (time.time() - start_time))
+                metrics["objective/kl_ref_seq"] = (
+                    self.accelerator.gather_for_metrics(kl_seq).mean().item()
+                )
+                metrics["objective/kl_ref_tok"] = (
+                    self.accelerator.gather_for_metrics(kl_tok).mean().item()
+                )
                 metrics["objective/kl_ref"] = (
                     self.accelerator.gather_for_metrics(mean_kl).mean().item()
                 )
-                metrics["policy/kl_old_new"] = (
-                    self.accelerator.gather_for_metrics(kl_old_new_stats).mean().item()
+                metrics["objective/entropy_seq"] = (
+                    self.accelerator.gather_for_metrics(entropy_seq).mean().item()
+                )
+                metrics["objective/entropy_tok"] = (
+                    self.accelerator.gather_for_metrics(entropy_tok).mean().item()
                 )
                 metrics["objective/entropy"] = (
                     self.accelerator.gather_for_metrics(mean_entropy).mean().item()
+                )
+                metrics["objective/non_score_reward_seq"] = (
+                    self.accelerator.gather_for_metrics(non_score_seq).mean().item()
+                )
+                metrics["objective/non_score_reward_tok"] = (
+                    self.accelerator.gather_for_metrics(non_score_tok).mean().item()
                 )
                 metrics["objective/non_score_reward"] = (
                     self.accelerator.gather_for_metrics(mean_non_score_reward)
                     .mean()
                     .item()
                 )
+                metrics["objective/rlhf_reward_seq"] = (
+                    self.accelerator.gather_for_metrics(reward_seq).mean().item()
+                )
+                metrics["objective/rlhf_reward_tok"] = (
+                    self.accelerator.gather_for_metrics(reward_tok).mean().item()
+                )
                 metrics["objective/rlhf_reward"] = (
                     self.accelerator.gather_for_metrics(rlhf_reward).mean().item()
-                )
-                metrics["objective/scores"] = (
-                    self.accelerator.gather_for_metrics(scores.mean()).mean().item()
                 )
                 metrics["policy/approxkl_avg"] = (
                     self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
