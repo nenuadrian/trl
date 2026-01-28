@@ -873,7 +873,10 @@ class VMPOTrainer(BaseTrainer):
         assert "eta_raw" in dual_param_names and "alpha_raw" in dual_param_names
         for group in self.optimizer.param_groups:
             param_ids = {id(p) for p in group["params"]}
-            if id(self.model.eta_raw) in param_ids or id(self.model.alpha_raw) in param_ids:
+            if (
+                id(self.model.eta_raw) in param_ids
+                or id(self.model.alpha_raw) in param_ids
+            ):
                 group["weight_decay"] = 0.0
 
         #########
@@ -1234,7 +1237,9 @@ class VMPOTrainer(BaseTrainer):
                 diff = (old_lp - logprobs).abs()
                 diff = diff.masked_fill(padding_mask, 0)
                 mean_diff = diff.sum() / ((~padding_mask).sum() + 1e-8)
-                assert mean_diff < 1e-4, "rollout_logits misaligned with stored logprobs"
+                assert (
+                    mean_diff < 1e-4
+                ), "rollout_logits misaligned with stored logprobs"
                 sequence_lengths_p1 = sequence_lengths + 1
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
                 values = torch.masked_fill(values, padding_mask_p1, 0)
@@ -1327,6 +1332,14 @@ class VMPOTrainer(BaseTrainer):
                     num_microbatches_in_minibatch = math.ceil(
                         args.local_mini_batch_size / args.per_device_train_batch_size
                     )
+                    if (
+                        args.gradient_accumulation_steps
+                        != num_microbatches_in_minibatch
+                    ):
+                        raise ValueError(
+                            "For minibatch-consistent V-MPO updates, set gradient_accumulation_steps "
+                            f"={num_microbatches_in_minibatch} (current: {args.gradient_accumulation_steps})."
+                        )
                     if mask_top_full.any():
                         adv_sel = adv_detach_full[mask_top_full]
                         log_mean_exp = torch.logsumexp(
@@ -1376,12 +1389,9 @@ class VMPOTrainer(BaseTrainer):
                                 padding_mask[micro_batch_inds],
                                 INVALID_LOGPROB,
                             )
-                            # Renormalize ψ within the microbatch to maintain consistent policy loss scaling
-                            psi_selected = psi[mask_top]
-                            psi_selected_sum = psi_selected.sum()
-                            if psi_selected_sum > 0:
-                                psi_selected = psi_selected / (psi_selected_sum + 1e-8)
-                            policy_loss = -(psi_selected * new_logprobs[mask_top]).sum()
+                            policy_loss = -(
+                                psi[mask_top] * new_logprobs[mask_top]
+                            ).sum()
 
                             vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                             vpred = torch.masked_fill(
