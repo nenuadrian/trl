@@ -604,15 +604,13 @@ def masked_var(
     mean = masked_mean(values, mask)
     centered_values = values - mean
     variance = masked_mean(centered_values**2, mask)
-    if unbiased:
-        mask_sum = mask.sum()
-        if mask_sum == 0:
-            raise ValueError(
-                "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
-                "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
-            )
-        # note that if mask_sum == 1, then there is a division by zero issue
-        # to avoid it you just need to use a larger minibatch_size
+    mask_sum = mask.sum()
+    if mask_sum == 0:
+        raise ValueError(
+            "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
+            "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
+        )
+    if unbiased and mask_sum > 1:
         bessel_correction = mask_sum / (mask_sum - 1)
         variance = variance * bessel_correction
     return variance
@@ -1155,7 +1153,6 @@ class VMPOTrainer(BaseTrainer):
                             ref_policy, query_response, processing_class.pad_token_id
                         )
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                    ref_logits /= args.temperature + 1e-7
                     ref_logprob = selective_log_softmax(ref_logits, response)
                     del ref_output, ref_logits
                     empty_cache()
@@ -1356,6 +1353,9 @@ class VMPOTrainer(BaseTrainer):
                         l_eta_full = torch.zeros((), device=device)
                     l_eta_full_values.append(l_eta_full.detach())
                     gradient_accumulation_idx = 0
+                    kl_sum_mb = torch.tensor(0.0, device=device)
+                    kl_count_mb = torch.tensor(0.0, device=device)
+                    should_step = False
                     for micro_batch_start in range(
                         0, args.local_mini_batch_size, args.per_device_train_batch_size
                     ):
@@ -1382,7 +1382,6 @@ class VMPOTrainer(BaseTrainer):
                                 model, mb_query_responses, processing_class.pad_token_id
                             )
                             logits = output.logits[:, context_length - 1 : -1]
-                            logits /= args.temperature + 1e-7
                             new_logprobs = selective_log_softmax(logits, mb_responses)
                             new_logprobs = torch.masked_fill(
                                 new_logprobs,
@@ -1422,36 +1421,38 @@ class VMPOTrainer(BaseTrainer):
                             kl_token = (p_old * (logp_old - logp_new)).sum(dim=-1)
                             kl_mask = ~padding_mask[micro_batch_inds]
                             kl_token = torch.masked_fill(kl_token, ~kl_mask, 0)
-                            kl_mean = kl_token.sum() / (kl_mask.sum() + 1e-8)
-                            alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-                            loss_alpha = (
-                                alpha * (args.eps_alpha - kl_mean.detach())
-                                + alpha.detach() * kl_mean
-                            )
-
+                            kl_sum_mb = kl_sum_mb + kl_token.sum().detach()
+                            kl_count_mb = kl_count_mb + kl_mask.sum().detach()
                             # Apply the temperature dual once per minibatch (batch-level sparsity control)
                             loss = (
                                 policy_loss
                                 + args.vf_coef * vf_loss
                                 + l_eta_full / num_microbatches_in_minibatch
-                                + loss_alpha
                             )
                             accelerator.backward(loss)
                             if accelerator.sync_gradients:
-                                optimizer.step()
-                                optimizer.zero_grad()
+                                should_step = True
                             with torch.no_grad():
                                 logprobs_diff = new_logprobs - mb_logprobs
-                                prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(
-                                    prob_dist * logits, dim=-1
+                                prob_dist = F.softmax(logits, dim=-1)
+                                entropy_token = torch.logsumexp(
+                                    logits, dim=-1
+                                ) - torch.sum(prob_dist * logits, dim=-1)
+                                entropy_token = torch.masked_fill(
+                                    entropy_token, ~kl_mask, 0
                                 )
-                                approxkl = 0.5 * (logprobs_diff**2).mean()
+                                entropy_mean = entropy_token.sum() / (
+                                    kl_mask.sum() + 1e-8
+                                )
+                                approxkl = torch.masked_fill(
+                                    0.5 * (logprobs_diff**2), ~kl_mask, 0
+                                )
+                                approxkl_mean = approxkl.sum() / (kl_mask.sum() + 1e-8)
                                 approxkl_stats[
                                     vmpo_epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
-                                ] = approxkl
+                                ] = approxkl_mean
                                 pg_loss_stats[
                                     vmpo_epoch_idx,
                                     minibatch_idx,
@@ -1471,13 +1472,23 @@ class VMPOTrainer(BaseTrainer):
                                     vmpo_epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
-                                ] = entropy.mean()
+                                ] = entropy_mean
                                 kl_old_new_stats[
                                     vmpo_epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
-                                ] = kl_mean
+                                ] = kl_token.sum() / (kl_mask.sum() + 1e-8)
                         gradient_accumulation_idx += 1
+                    kl_mean_mb = kl_sum_mb / (kl_count_mb + 1e-8)
+                    alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
+                    loss_alpha_mb = (
+                        alpha * (args.eps_alpha - kl_mean_mb.detach())
+                        + alpha.detach() * kl_mean_mb
+                    )
+                    accelerator.backward(loss_alpha_mb)
+                    if should_step:
+                        optimizer.step()
+                        optimizer.zero_grad()
                     minibatch_idx += 1
                     del (
                         output,
@@ -1491,44 +1502,25 @@ class VMPOTrainer(BaseTrainer):
                         vf_loss,
                         vf_clipfrac,
                         prob_dist,
-                        entropy,
+                        entropy_token,
+                        entropy_mean,
                         approxkl,
-                        mb_return,
-                        mb_advantage,
-                        mb_values,
-                        mb_responses,
-                        mb_query_responses,
-                        mb_logprobs,
-                        mask_valid_full,
-                        adv_detach_full,
-                        adv_valid,
-                        num_valid,
-                        top_k,
-                        mask_top_full,
-                        eta,
-                        w_full,
-                        w_sum_full,
-                        psi_full,
-                        mask_top,
-                        psi,
+                        approxkl_mean,
                         logprobs_diff,
-                        loss,
-                        old_logits,
-                        logp_old,
-                        logp_new,
-                        p_old,
-                        kl_token,
-                        kl_mask,
-                        kl_mean,
                         alpha,
-                        loss_alpha,
-                        l_eta_full,
+                        loss_alpha_mb,
+                        kl_sum_mb,
+                        kl_count_mb,
+                        kl_mean_mb,
+                        should_step,
                         num_microbatches_in_minibatch,
                     )
                     empty_cache()
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
-                mean_entropy = (-logprobs).sum(1).mean()
+                mean_entropy = -(logprobs * (~padding_mask)).sum() / (
+                    (~padding_mask).sum() + 1e-8
+                )
                 mean_non_score_reward = non_score_reward.sum(1).mean()
                 rlhf_reward = mean_non_score_reward + scores.mean()
                 eta_value = F.softplus(self.model.eta_raw) + args.eta_min
