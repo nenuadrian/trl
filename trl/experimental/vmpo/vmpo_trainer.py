@@ -1264,10 +1264,6 @@ class VMPOTrainer(BaseTrainer):
                 # logging masks/summaries
                 valid_tok_mask = ~padding_mask
                 valid_tok_count = valid_tok_mask.sum(1)
-                psi_state = psi_global.sum(dim=1)
-                psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
-                kl_state = kl.sum(dim=1)
-                kl_weighted_states = (psi_state * kl_state).sum()
                 entropy_seq = -(logprobs.masked_fill(padding_mask, 0)).sum(1)
                 entropy_tok = entropy_seq.sum() / (valid_tok_count.sum() + 1e-8)
                 reward_valid_mask = ~padding_mask_p1
