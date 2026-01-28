@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import Accelerator, logging
 from accelerate.utils import broadcast, gather_object
 from datasets import Dataset
@@ -138,36 +139,38 @@ class VMPOConfig(TrainingArguments):
             Name of this experiment.
         reward_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
             Path to the reward model.
-        model_adapter_name (`str`, *optional*):
-            Name of the train target PEFT adapter, when using LoRA with multiple adapters.
-        ref_adapter_name (`str`, *optional*):
-            Name of the reference PEFT adapter, when using LoRA with multiple adapters.
-        num_vmpo_epochs (`int`, *optional*, defaults to `4`):
-            Number of epochs to train.
-        whiten_rewards (`bool`, *optional*, defaults to `False`):
-            Whether to whiten the rewards.
-        kl_coef (`float`, *optional*, defaults to `0.05`):
-            KL coefficient.
-        kl_estimator (`Literal["k1", "k3"]`, *optional*, defaults to `"k1"`):
-            Which estimator for KL-Divergence to use from [Approximating KL
-            Divergence](http://joschu.net/blog/kl-approx.html). Defaults to "k1", a straightforward, unbiased
-            estimator. Can be set to "k3", an unbiased estimator with lower variance which "appears to be a strictly
-            better estimator". Cannot be set to "k2", as it is used for logging purposes.
-        cliprange (`float`, *optional*, defaults to `0.2`):
-            Clip range.
-        vf_coef (`float`, *optional*, defaults to `0.1`):
-            Value function coefficient.
-        cliprange_value (`float`, *optional*, defaults to `0.2`):
-            Clip range for the value function.
-        gamma (`float`, *optional*, defaults to `1.0`):
-            Discount factor.
-        lam (`float`, *optional*, defaults to `0.95`):
-            Lambda value for GAE.
-        ds3_gather_for_generation (`bool`, *optional*, defaults to `True`):
-            This setting applies to DeepSpeed ZeRO-3. If enabled, the policy model weights are gathered for generation,
-            improving generation speed. However, disabling this option allows training models that exceed the VRAM
-            capacity of a single GPU, albeit at the cost of slower generation.
     """
+
+    eps_eta: float = field(
+        default=0.1,
+        metadata={"help": "Dual variable target εη for the V-MPO temperature loss."},
+    )
+    eta_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial value for the V-MPO temperature η."},
+    )
+    eta_min: float = field(
+        default=1e-4,
+        metadata={"help": "Minimum value added after softplus to keep η positive."},
+    )
+    top_frac: float = field(
+        default=0.5,
+        metadata={
+            "help": "Fraction of valid token advantages to keep for V-MPO weighting (top fraction by advantage)."
+        },
+    )
+    eps_alpha: float = field(
+        default=0.01,
+        metadata={"help": "KL trust region target εα for V-MPO dual α."},
+    )
+    alpha_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial value for the V-MPO KL dual α."},
+    )
+    alpha_min: float = field(
+        default=1e-4,
+        metadata={"help": "Minimum value added after softplus to keep α positive."},
+    )
 
     # Parameters whose default values are overridden from TrainingArguments
     logging_steps: float = field(
@@ -336,7 +339,8 @@ class VMPOConfig(TrainingArguments):
     kl_estimator: Literal["k1", "k3"] = field(
         default="k1",
         metadata={
-            "help": "Which estimator for KL-Divergence to use from Approximating KL Divergence "
+            "help": "Which estimator for KL-Divergence to use from Approximating KL "
+            "Divergence "
             "(http://joschu.net/blog/kl-approx.html). Defaults to 'k1', a straightforward, unbiased estimator. Can be "
             "set to 'k3', an unbiased estimator with lower variance which 'appears to be a strictly better "
             "estimator'. Cannot be set to 'k2', as it is used for logging purposes."
@@ -401,6 +405,11 @@ if is_peft_available():
 
 
 INVALID_LOGPROB = 1.0
+
+
+def inv_softplus(x: torch.Tensor) -> torch.Tensor:
+    # assumes x > 0; stable inverse of softplus
+    return x + torch.log1p(-torch.exp(-x))
 
 
 def generate(
@@ -851,9 +860,20 @@ class VMPOTrainer(BaseTrainer):
                 disable_dropout_in_model(module)
         self.model = PolicyAndValueWrapper(self.policy_model, self.value_model)
         self.model.config = self.policy_model.config  # needed for pushing to hub
+        self.model.eta_raw = nn.Parameter(
+            inv_softplus(torch.tensor(args.eta_init, device=self.accelerator.device))
+        )
+        self.model.alpha_raw = nn.Parameter(
+            inv_softplus(torch.tensor(args.alpha_init, device=self.accelerator.device))
+        )
         self.create_optimizer_and_scheduler(
             num_training_steps=args.num_total_batches
         )  # note that we are calling `self.lr_scheduler.step()` manually only at the batch level
+        dual_param_names = {n for n, _ in self.model.named_parameters()}
+        assert "eta_raw" in dual_param_names and "alpha_raw" in dual_param_names
+        for group in self.optimizer.param_groups:
+            if self.model.eta_raw in group["params"] or self.model.alpha_raw in group["params"]:
+                group["weight_decay"] = 0.0
 
         #########
         # trainer specifics
@@ -1027,12 +1047,11 @@ class VMPOTrainer(BaseTrainer):
             args.gradient_accumulation_steps,
         )
         approxkl_stats = torch.zeros(stats_shape, device=device)
-        pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
         pg_loss_stats = torch.zeros(stats_shape, device=device)
         vf_loss_stats = torch.zeros(stats_shape, device=device)
         vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
         entropy_stats = torch.zeros(stats_shape, device=device)
-        ratio_stats = torch.zeros(stats_shape, device=device)
+        kl_old_new_stats = torch.zeros(stats_shape, device=device)
         model.train()
 
         # trainer state initialization
@@ -1072,6 +1091,12 @@ class VMPOTrainer(BaseTrainer):
             self.model_wrapped = self.model
 
         for update in range(1, args.num_total_batches + 1):
+            approxkl_stats.zero_()
+            pg_loss_stats.zero_()
+            vf_loss_stats.zero_()
+            vf_clipfrac_stats.zero_()
+            entropy_stats.zero_()
+            kl_old_new_stats.zero_()
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
@@ -1084,6 +1109,7 @@ class VMPOTrainer(BaseTrainer):
                 scores = []
                 sequence_lengths = []
                 values = []
+                rollout_logits = []
                 with unwrap_model_for_generation(
                     self.model,
                     self.accelerator,
@@ -1108,6 +1134,7 @@ class VMPOTrainer(BaseTrainer):
                     response = query_response[:, context_length:]
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     logprob = selective_log_softmax(logits, response)
+                    rollout_logits.append(logits / (args.temperature + 1e-7))
                     del logits
                     empty_cache()
 
@@ -1176,6 +1203,7 @@ class VMPOTrainer(BaseTrainer):
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
+                rollout_logits = torch.cat(rollout_logits, 0)
                 del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 empty_cache()
                 gc.collect()
@@ -1199,6 +1227,12 @@ class VMPOTrainer(BaseTrainer):
                 ref_logprobs = torch.masked_fill(
                     ref_logprobs, padding_mask, INVALID_LOGPROB
                 )
+                # rollout logits alignment check
+                old_lp = selective_log_softmax(rollout_logits, responses)
+                diff = (old_lp - logprobs).abs()
+                diff = diff.masked_fill(padding_mask, 0)
+                mean_diff = diff.sum() / ((~padding_mask).sum() + 1e-8)
+                assert mean_diff < 1e-4, "rollout_logits misaligned with stored logprobs"
                 sequence_lengths_p1 = sequence_lengths + 1
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
                 values = torch.masked_fill(values, padding_mask_p1, 0)
@@ -1241,7 +1275,7 @@ class VMPOTrainer(BaseTrainer):
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
                 empty_cache()
 
-            # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+            # Do multiple epochs of V-MPO training
             for vmpo_epoch_idx in range(args.num_vmpo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
@@ -1250,6 +1284,60 @@ class VMPOTrainer(BaseTrainer):
                 ):
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
+
+                    # E-step weights (once per minibatch)
+                    mb_advantage_full = advantages[mini_batch_inds]
+                    padding_mask_full = padding_mask[mini_batch_inds]
+                    mask_valid_full = ~padding_mask_full
+                    adv_detach_full = mb_advantage_full.detach()
+                    adv_valid = adv_detach_full[mask_valid_full]
+                    num_valid = adv_valid.numel()
+                    top_k = (
+                        int(torch.ceil(torch.tensor(num_valid * args.top_frac)).item())
+                        if num_valid > 0
+                        else 0
+                    )
+                    threshold = None
+                    if top_k > 0:
+                        threshold = adv_valid.topk(top_k).values.min()
+                        mask_top_full = mask_valid_full & (adv_detach_full >= threshold)
+                    else:
+                        mask_top_full = torch.zeros_like(
+                            mask_valid_full, dtype=torch.bool
+                        )
+                    eta = F.softplus(self.model.eta_raw) + args.eta_min
+                    w_full = torch.zeros_like(mb_advantage_full)
+                    w_full[mask_top_full] = torch.exp(
+                        adv_detach_full[mask_top_full] / (eta + 1e-8)
+                    )
+                    w_sum_full = w_full.sum()
+                    psi_full = (
+                        torch.where(
+                            mask_top_full,
+                            w_full / (w_sum_full + 1e-8),
+                            torch.zeros_like(w_full),
+                        )
+                        if w_sum_full.item() > 0
+                        else torch.zeros_like(w_full)
+                    )
+                    num_microbatches_in_minibatch = math.ceil(
+                        args.local_mini_batch_size / args.per_device_train_batch_size
+                    )
+                    if mask_top_full.any():
+                        adv_sel = adv_detach_full[mask_top_full]
+                        log_mean_exp = torch.logsumexp(
+                            adv_sel / (eta + 1e-8), dim=0
+                        ) - torch.log(
+                            torch.tensor(
+                                float(adv_sel.numel()),
+                                device=adv_sel.device,
+                                dtype=adv_sel.dtype,
+                            )
+                        )
+                        l_eta_full = eta * (args.eps_eta + log_mean_exp)
+                    else:
+                        l_eta_full = torch.zeros((), device=device)
+
                     gradient_accumulation_idx = 0
                     for micro_batch_start in range(
                         0, args.local_mini_batch_size, args.per_device_train_batch_size
@@ -1261,12 +1349,17 @@ class VMPOTrainer(BaseTrainer):
                             micro_batch_inds = mini_batch_inds[
                                 micro_batch_start:micro_batch_end
                             ]
+                            micro_batch_slice = slice(
+                                micro_batch_start, micro_batch_end
+                            )
                             mb_advantage = advantages[micro_batch_inds]
                             mb_responses = responses[micro_batch_inds]
                             mb_query_responses = query_responses[micro_batch_inds]
                             mb_logprobs = logprobs[micro_batch_inds]
                             mb_return = returns[micro_batch_inds]
                             mb_values = values[micro_batch_inds]
+                            psi = psi_full[micro_batch_slice]
+                            mask_top = mask_top_full[micro_batch_slice]
 
                             output, vpred_temp = forward(
                                 model, mb_query_responses, processing_class.pad_token_id
@@ -1298,25 +1391,53 @@ class VMPOTrainer(BaseTrainer):
                                 (vf_losses2 > vf_losses1).float(),
                                 ~padding_mask_p1[micro_batch_inds],
                             )
-                            logprobs_diff = new_logprobs - mb_logprobs
-                            ratio = torch.exp(logprobs_diff)
-                            pg_losses = -mb_advantage * ratio
-                            pg_losses2 = -mb_advantage * torch.clamp(
-                                ratio, 1.0 - args.cliprange, 1.0 + args.cliprange
+
+                            policy_loss = -(
+                                psi[mask_top] * new_logprobs[mask_top]
+                            ).sum()  # zero if no selected tokens
+
+                            # KL trust region dual (Lα) over all valid tokens
+                            old_logits = rollout_logits[micro_batch_inds]
+                            logp_old = F.log_softmax(old_logits, dim=-1)
+                            logp_new = F.log_softmax(logits, dim=-1)
+                            p_old = logp_old.exp()
+                            kl_token = (p_old * (logp_old - logp_new)).sum(dim=-1)
+                            kl_mask = ~padding_mask[micro_batch_inds]
+                            kl_token = torch.masked_fill(kl_token, ~kl_mask, 0)
+                            kl_mean = kl_token.sum() / (kl_mask.sum() + 1e-8)
+                            alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
+                            loss_alpha = (
+                                alpha * (args.eps_alpha - kl_mean.detach())
+                                + alpha.detach() * kl_mean
                             )
-                            pg_loss_max = torch.max(pg_losses, pg_losses2)
-                            pg_loss = masked_mean(
-                                pg_loss_max, ~padding_mask[micro_batch_inds]
-                            )
-                            loss = pg_loss + args.vf_coef * vf_loss
-                            accelerator.backward(loss)
-                            optimizer.step()
-                            optimizer.zero_grad()
-                            with torch.no_grad():
-                                pg_clipfrac = masked_mean(
-                                    (pg_losses2 > pg_losses).float(),
-                                    ~padding_mask[micro_batch_inds],
+
+                            # Temperature dual (Lη) on selected tokens
+                            if mask_top.any():
+                                adv_sel = mb_advantage.detach()[mask_top]
+                                log_mean_exp = torch.logsumexp(
+                                    adv_sel / (eta + 1e-8), dim=0
+                                ) - torch.log(
+                                    torch.tensor(
+                                        float(adv_sel.numel()), device=adv_sel.device
+                                    )
                                 )
+                                l_eta = eta * (args.eps_eta + log_mean_exp)
+                            else:
+                                l_eta = torch.zeros((), device=mb_advantage.device)
+
+                            # Total V-MPO loss
+                            loss = (
+                                policy_loss
+                                + args.vf_coef * vf_loss
+                                + l_eta_full / num_microbatches_in_minibatch
+                                + loss_alpha
+                            )
+                            accelerator.backward(loss)
+                            if accelerator.sync_gradients:
+                                optimizer.step()
+                                optimizer.zero_grad()
+                            with torch.no_grad():
+                                logprobs_diff = new_logprobs - mb_logprobs
                                 prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(
                                     prob_dist * logits, dim=-1
@@ -1327,16 +1448,11 @@ class VMPOTrainer(BaseTrainer):
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = approxkl
-                                pg_clipfrac_stats[
-                                    vmpo_epoch_idx,
-                                    minibatch_idx,
-                                    gradient_accumulation_idx,
-                                ] = pg_clipfrac
                                 pg_loss_stats[
                                     vmpo_epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
-                                ] = pg_loss
+                                ] = policy_loss
                                 vf_loss_stats[
                                     vmpo_epoch_idx,
                                     minibatch_idx,
@@ -1352,22 +1468,59 @@ class VMPOTrainer(BaseTrainer):
                                     minibatch_idx,
                                     gradient_accumulation_idx,
                                 ] = entropy.mean()
-                                ratio_stats[
+                                kl_old_new_stats[
                                     vmpo_epoch_idx,
                                     minibatch_idx,
                                     gradient_accumulation_idx,
-                                ] = ratio.mean()
+                                ] = kl_mean
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
-                    # del everything and empty cache
-                    # fmt: off
                     del (
-                        output, vpred_temp, logits, new_logprobs, vpred, vpredclipped,
-                        vf_losses1, vf_losses2, vf_loss, vf_clipfrac, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max,
-                        pg_loss, loss, pg_clipfrac, prob_dist, entropy, approxkl, mb_return,
-                        mb_advantage, mb_values, mb_responses, mb_query_responses, mb_logprobs,
+                        output,
+                        vpred_temp,
+                        logits,
+                        new_logprobs,
+                        vpred,
+                        vpredclipped,
+                        vf_losses1,
+                        vf_losses2,
+                        vf_loss,
+                        vf_clipfrac,
+                        prob_dist,
+                        entropy,
+                        approxkl,
+                        mb_return,
+                        mb_advantage,
+                        mb_values,
+                        mb_responses,
+                        mb_query_responses,
+                        mb_logprobs,
+                        mask_valid_full,
+                        adv_detach_full,
+                        adv_valid,
+                        num_valid,
+                        top_k,
+                        mask_top_full,
+                        eta,
+                        w_full,
+                        w_sum_full,
+                        psi_full,
+                        mask_top,
+                        psi,
+                        logprobs_diff,
+                        loss,
+                        old_logits,
+                        logp_old,
+                        logp_new,
+                        p_old,
+                        kl_token,
+                        kl_mask,
+                        kl_mean,
+                        alpha,
+                        loss_alpha,
+                        l_eta_full,
+                        num_microbatches_in_minibatch,
                     )
-                    # fmt: on
                     empty_cache()
             with torch.no_grad():
                 mean_kl = kl.sum(1).mean()
@@ -1377,8 +1530,11 @@ class VMPOTrainer(BaseTrainer):
                 eps = int(self.state.episode / (time.time() - start_time))
                 metrics = {}
                 metrics["eps"] = eps
-                metrics["objective/kl"] = (
+                metrics["objective/kl_ref"] = (
                     self.accelerator.gather_for_metrics(mean_kl).mean().item()
+                )
+                metrics["policy/kl_old_new"] = (
+                    self.accelerator.gather_for_metrics(kl_old_new_stats).mean().item()
                 )
                 metrics["objective/entropy"] = (
                     self.accelerator.gather_for_metrics(mean_entropy).mean().item()
@@ -1397,9 +1553,6 @@ class VMPOTrainer(BaseTrainer):
                 metrics["policy/approxkl_avg"] = (
                     self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
                 )
-                metrics["policy/clipfrac_avg"] = (
-                    self.accelerator.gather_for_metrics(pg_clipfrac_stats).mean().item()
-                )
                 metrics["loss/policy_avg"] = (
                     self.accelerator.gather_for_metrics(pg_loss_stats).mean().item()
                 )
@@ -1411,12 +1564,6 @@ class VMPOTrainer(BaseTrainer):
                 )
                 metrics["policy/entropy_avg"] = (
                     self.accelerator.gather_for_metrics(entropy_stats).mean().item()
-                )
-                metrics["val/ratio"] = (
-                    self.accelerator.gather_for_metrics(ratio_stats).mean().item()
-                )
-                metrics["val/ratio_var"] = (
-                    self.accelerator.gather_for_metrics(ratio_stats).var().item()
                 )
                 metrics["val/num_eos_tokens"] = (
                     (responses == processing_class.eos_token_id).sum().item()
@@ -1474,6 +1621,7 @@ class VMPOTrainer(BaseTrainer):
                 actual_end,
                 advantages,
                 returns,
+                rollout_logits,
             )
             empty_cache()
 
