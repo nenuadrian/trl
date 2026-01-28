@@ -252,9 +252,7 @@ class VMPOConfig(TrainingArguments):
     )
     eos_bonus: float = field(
         default=0.1,
-        metadata={
-            "help": "Optional positive shaping reward added at the EOS position."
-        },
+        metadata={"help": "Optional positive shaping reward added at the EOS position."},
     )
     sft_model_path: str = field(
         default="EleutherAI/pythia-160m",
@@ -365,9 +363,7 @@ class VMPOConfig(TrainingArguments):
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
         if self.missing_eos_penalty is not None and self.missing_eos_penalty <= 0:
-            raise ValueError(
-                "`missing_eos_penalty` must be > 0 to enable EOS penalization."
-            )
+            raise ValueError("`missing_eos_penalty` must be > 0 to enable EOS penalization.")
         if self.eos_bonus < 0:
             raise ValueError("`eos_bonus` must be non-negative.")
         super().__post_init__()
@@ -1148,14 +1144,11 @@ class VMPOTrainer(BaseTrainer):
                     postprocessed_query_response = torch.cat(
                         (query, postprocessed_response), 1
                     )
-                    pad_mask = postprocessed_response == processing_class.pad_token_id
-                    has_pad = pad_mask.any(dim=1)
-                    pad_idx = first_true_indices(pad_mask)
-
-                    sequence_length = torch.where(
-                        has_pad,
-                        pad_idx - 1,
-                        torch.full_like(pad_idx, postprocessed_response.shape[1] - 1),
+                    sequence_length = (
+                        first_true_indices(
+                            postprocessed_response == processing_class.pad_token_id
+                        )
+                        - 1
                     )
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
@@ -1234,13 +1227,9 @@ class VMPOTrainer(BaseTrainer):
                 )
                 rewards[actual_start, actual_end] += scores
                 if args.eos_bonus > 0:
-                    eos_positions = first_true_indices(
-                        postprocessed_responses == eos_id
-                    )
+                    eos_positions = first_true_indices(postprocessed_responses == eos_id)
                     has_eos = contain_eos_token_post
-                    batch_idx = torch.arange(rewards.size(0), device=rewards.device)[
-                        has_eos
-                    ]
+                    batch_idx = torch.arange(rewards.size(0), device=rewards.device)[has_eos]
                     rewards[batch_idx, eos_positions[has_eos]] += args.eos_bonus
                 # logging masks/summaries
                 reward_valid_mask = ~padding_mask_p1
@@ -1261,22 +1250,20 @@ class VMPOTrainer(BaseTrainer):
                 for t in reversed(range(gen_length)):
                     nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
                     delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
-                    not_done = ~padding_mask_p1[:, t]
-                    lastgaelam = delta + args.gamma * args.lam * lastgaelam * not_done
+                    lastgaelam = delta + args.gamma * args.lam * lastgaelam
                     advantages_reversed.append(lastgaelam)
                 raw_advantages = torch.stack(advantages_reversed[::-1], axis=1)
                 returns = raw_advantages + values
+                advantages = raw_advantages  # keep raw scale for policy/dual alignment
                 empty_cache()
 
             # Global E-step (compute ψ once per rollout and update η/α)
             eta = F.softplus(self.model.eta_raw) + args.eta_min
             alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
             # sequence-level ψ: aggregate advantages per sequence before weighting
-            mask_valid = ~padding_mask_p1
+            mask_valid = ~padding_mask
             valid_len = mask_valid.sum(dim=1).clamp_min(1)
-            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(
-                dim=1
-            ) / valid_len
+            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1) / valid_len
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
             num_seqs = adv_seq.numel()
@@ -1314,7 +1301,7 @@ class VMPOTrainer(BaseTrainer):
                 mb_query_response = torch.cat((mb_query, mb_response), 1)
                 psi_mb = psi_global[mini_batch_inds]
                 psi_state_mb = psi_state[mini_batch_inds]
-                mask_valid_mb = ~padding_mask_p1[mini_batch_inds]
+                mask_valid_mb = ~padding_mask[mini_batch_inds]
 
                 policy_outputs = forward(
                     model.policy,
@@ -1355,8 +1342,12 @@ class VMPOTrainer(BaseTrainer):
                     value_loss = torch.zeros((), device=device)
 
                 # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
-                kl_terms_mb = (logprobs[mini_batch_inds] - new_logprobs) * mask_valid_mb
-                kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
+                kl_terms_mb = (
+                    logprobs[mini_batch_inds] - new_logprobs
+                ) * mask_valid_mb
+                kl_state_mb = kl_terms_mb.sum(dim=1) / (
+                    mask_valid_mb.sum(dim=1) + 1e-8
+                )
                 kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
                 alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
                 total_loss = (
