@@ -139,6 +139,8 @@ class VMPOConfig(TrainingArguments):
             Name of this experiment.
         reward_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
             Path to the reward model.
+        value_clip (`float`, *optional*, defaults to `0.2`):
+            Clip range for value targets (±value_clip).
     """
 
     eps_eta: float = field(
@@ -325,7 +327,7 @@ class VMPOConfig(TrainingArguments):
         },
     )
     num_vmpo_epochs: int = field(
-        default=4,
+        default=1,
         metadata={"help": "Number of epochs to train."},
     )
     whiten_rewards: bool = field(
@@ -346,17 +348,13 @@ class VMPOConfig(TrainingArguments):
             "estimator'. Cannot be set to 'k2', as it is used for logging purposes."
         },
     )
-    cliprange: float = field(
-        default=0.2,
-        metadata={"help": "Clip range."},
-    )
     vf_coef: float = field(
         default=0.1,
         metadata={"help": "Value function coefficient."},
     )
-    cliprange_value: float = field(
+    value_clip: float = field(
         default=0.2,
-        metadata={"help": "Clip range for the value function."},
+        metadata={"help": "Clip range for value targets (±value_clip)."},
     )
     gamma: float = field(
         default=1.0,
@@ -864,18 +862,27 @@ class VMPOTrainer(BaseTrainer):
         self.model.alpha_raw = nn.Parameter(
             inv_softplus(torch.tensor(args.alpha_init, device=self.accelerator.device))
         )
-        self.create_optimizer_and_scheduler(
-            num_training_steps=args.num_total_batches
-        )  # note that we are calling `self.lr_scheduler.step()` manually only at the batch level
-        dual_param_names = {n for n, _ in self.model.named_parameters()}
-        assert "eta_raw" in dual_param_names and "alpha_raw" in dual_param_names
+        self.create_optimizer_and_scheduler(num_training_steps=args.num_total_batches)
+        dual_param_ids = {id(self.model.eta_raw), id(self.model.alpha_raw)}
         for group in self.optimizer.param_groups:
-            param_ids = {id(p) for p in group["params"]}
-            if (
-                id(self.model.eta_raw) in param_ids
-                or id(self.model.alpha_raw) in param_ids
-            ):
-                group["weight_decay"] = 0.0
+            group["params"] = [
+                p for p in group["params"] if id(p) not in dual_param_ids
+            ]
+        self.optimizer.param_groups = [
+            g for g in self.optimizer.param_groups if len(g["params"]) > 0
+        ]
+        eta_lr = self.args.learning_rate * 0.1
+        alpha_lr = self.args.learning_rate
+        self.eta_optimizer = torch.optim.Adam(
+            [self.model.eta_raw],
+            lr=eta_lr,
+            weight_decay=0.0,
+        )
+        self.alpha_optimizer = torch.optim.Adam(
+            [self.model.alpha_raw],
+            lr=alpha_lr,
+            weight_decay=0.0,
+        )
 
         #########
         # trainer specifics
@@ -1244,11 +1251,9 @@ class VMPOTrainer(BaseTrainer):
                 # 4. compute rewards
                 # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
                 logr = ref_logprobs - logprobs
-                kl = (
-                    -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr
-                )  # Else statement is k3
-                non_score_reward = -args.kl_coef * kl
-                rewards = non_score_reward.clone()
+                kl = -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr
+                # trust region KL is handled by α; no PPO-style shaping
+                rewards = torch.zeros_like(kl)
                 actual_start = torch.arange(rewards.size(0), device=rewards.device)
                 actual_end = torch.where(
                     sequence_lengths_p1 < rewards.size(1),
@@ -1259,12 +1264,12 @@ class VMPOTrainer(BaseTrainer):
                 # logging masks/summaries
                 valid_tok_mask = ~padding_mask
                 valid_tok_count = valid_tok_mask.sum(1)
-                kl_seq = kl.masked_fill(padding_mask, 0).sum(1)
-                kl_tok = kl_seq.sum() / (valid_tok_count.sum() + 1e-8)
+                psi_state = psi_global.sum(dim=1)
+                psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
+                kl_state = kl.sum(dim=1)
+                kl_weighted_states = (psi_state * kl_state).sum()
                 entropy_seq = -(logprobs.masked_fill(padding_mask, 0)).sum(1)
                 entropy_tok = entropy_seq.sum() / (valid_tok_count.sum() + 1e-8)
-                non_score_seq = non_score_reward.masked_fill(padding_mask, 0).sum(1)
-                non_score_tok = non_score_seq.sum() / (valid_tok_count.sum() + 1e-8)
                 reward_valid_mask = ~padding_mask_p1
                 reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
                 reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
@@ -1285,13 +1290,53 @@ class VMPOTrainer(BaseTrainer):
                     delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
                     lastgaelam = delta + args.gamma * args.lam * lastgaelam
                     advantages_reversed.append(lastgaelam)
-                advantages = torch.stack(advantages_reversed[::-1], axis=1)
-                returns = advantages + values
-                advantages = masked_whiten(advantages, ~padding_mask)
-                advantages = torch.masked_fill(advantages, padding_mask, 0)
+                raw_advantages = torch.stack(advantages_reversed[::-1], axis=1)
+                returns = raw_advantages + values
+                advantages = raw_advantages  # keep raw scale for policy/dual alignment
                 empty_cache()
 
+            # Global E-step (compute ψ once per rollout and update η/α)
+            eta = F.softplus(self.model.eta_raw) + args.eta_min
+            alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
+            adv_detach = raw_advantages.detach()
+            mask_valid = ~padding_mask
+            psi_global = torch.zeros_like(raw_advantages)
+            l_eta = torch.zeros((), device=device)
+            l_alpha = torch.zeros((), device=device)
+            adv_valid = adv_detach[mask_valid]
+            num_valid = adv_valid.numel()
+            if num_valid > 0:
+                top_k = int(torch.ceil(torch.tensor(num_valid * args.top_frac)).item())
+                mask_top = torch.zeros_like(mask_valid, dtype=torch.bool)
+                if top_k > 0:
+                    threshold = adv_valid.topk(top_k).values.min()
+                    mask_top = mask_valid & (adv_detach >= threshold)
+                    w = torch.zeros_like(adv_detach)
+                    max_adv = adv_detach[mask_top].max()
+                    w[mask_top] = torch.exp(
+                        (adv_detach[mask_top] - max_adv) / (eta + 1e-8)
+                    )
+                    w_sum = w.sum()
+                    psi_global = torch.where(
+                        mask_top,
+                        w / (w_sum + 1e-8),
+                        torch.zeros_like(w),
+                    )
+                    log_mean_exp = torch.logsumexp(
+                        adv_detach[mask_top] / (eta + 1e-8), dim=0
+                    ) - torch.log(torch.tensor(float(mask_top.sum()), device=device))
+                    l_eta = eta * (args.eps_eta + log_mean_exp)
+            self.eta_optimizer.zero_grad()
+            if l_eta.requires_grad:
+                l_eta.backward(retain_graph=True)
+                self.eta_optimizer.step()
+                l_eta_full_values.append(l_eta.detach())
+            if l_alpha.requires_grad:
+                l_alpha.backward()
+                self.alpha_optimizer.step()
             # Do multiple epochs of V-MPO training
+            kl_weighted_accum = torch.zeros((), device=device)
+            kl_mb_count = 0
             for vmpo_epoch_idx in range(args.num_vmpo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
@@ -1301,96 +1346,113 @@ class VMPOTrainer(BaseTrainer):
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
 
-                    # E-step weights (once per minibatch)
-                    mb_advantage_full = advantages[mini_batch_inds]
-                    padding_mask_full = padding_mask[mini_batch_inds]
-                    mask_valid_full = ~padding_mask_full
-                    adv_detach_full = mb_advantage_full.detach()
-                    adv_valid = adv_detach_full[mask_valid_full]
-                    num_valid = adv_valid.numel()
-                    top_k = (
-                        int(torch.ceil(torch.tensor(num_valid * args.top_frac)).item())
-                        if num_valid > 0
-                        else 0
+                    mb_query = queries[mini_batch_inds]
+                    mb_response = responses[mini_batch_inds]
+                    mb_query_response = torch.cat((mb_query, mb_response), 1)
+                    psi_mb = psi_global[mini_batch_inds]
+                    psi_state_mb = psi_state[mini_batch_inds]
+                    mask_valid_mb = ~padding_mask[mini_batch_inds]
+
+                    policy_outputs = forward(
+                        model.policy,
+                        mb_query_response,
+                        processing_class.pad_token_id,
                     )
-                    threshold = None
-                    if top_k > 0:
-                        threshold = adv_valid.topk(top_k).values.min()
-                        mask_top_full = mask_valid_full & (adv_detach_full >= threshold)
+                    new_logits = policy_outputs.logits[:, context_length - 1 : -1]
+                    new_logprobs = selective_log_softmax(new_logits, mb_response)
+
+                    if psi_mb.sum() > 0:
+                        policy_loss = -(
+                            (psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8)
+                        )
                     else:
-                        mask_top_full = torch.zeros_like(
-                            mask_valid_full, dtype=torch.bool
-                        )
-                    eta = F.softplus(self.model.eta_raw) + args.eta_min
-                    w_full = torch.zeros_like(mb_advantage_full)
-                    if mask_top_full.any():
-                        max_adv = adv_detach_full[mask_top_full].max()
-                        w_full[mask_top_full] = torch.exp(
-                            (adv_detach_full[mask_top_full] - max_adv) / (eta + 1e-8)
-                        )
-                    w_sum_full = w_full.sum()
-                    psi_full = (
-                        torch.where(
-                            mask_top_full,
-                            w_full / (w_sum_full + 1e-8),
-                            torch.zeros_like(w_full),
-                        )
-                        if w_sum_full.item() > 0
-                        else torch.zeros_like(w_full)
+                        policy_loss = torch.zeros((), device=device)
+
+                    value_full, _, _ = get_reward(
+                        self.accelerator.unwrap_model(model).value_model,
+                        mb_query_response,
+                        processing_class.pad_token_id,
+                        context_length,
                     )
-                    num_microbatches_in_minibatch = math.ceil(
-                        args.local_mini_batch_size / args.per_device_train_batch_size
-                    )
-                    if (
-                        args.gradient_accumulation_steps
-                        != num_microbatches_in_minibatch
-                    ):
-                        raise ValueError(
-                            "For minibatch-consistent V-MPO updates, set gradient_accumulation_steps "
-                            f"={num_microbatches_in_minibatch} (current: {args.gradient_accumulation_steps})."
+                    value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
+                    value_mask = ~padding_mask_p1[mini_batch_inds]
+                    with torch.no_grad():
+                        value_old_mb = values[mini_batch_inds]
+                        returns_mb = returns[mini_batch_inds]
+                        delta = (returns_mb - value_old_mb).clamp(
+                            -args.value_clip, args.value_clip
                         )
-                    if mask_top_full.any():
-                        adv_sel = adv_detach_full[mask_top_full]
-                        log_mean_exp = torch.logsumexp(
-                            adv_sel / (eta + 1e-8), dim=0
-                        ) - torch.log(
-                            torch.tensor(
-                                float(adv_sel.numel()),
-                                device=adv_sel.device,
-                                dtype=adv_sel.dtype,
-                            )
+                        value_target = value_old_mb + delta
+                    if value_mask.any():
+                        value_loss = F.mse_loss(
+                            value_pred[value_mask],
+                            value_target[value_mask],
                         )
-                        l_eta_full = eta * (args.eps_eta + log_mean_exp)
                     else:
-                        l_eta_full = torch.zeros((), device=device)
-                    l_eta_full_values.append(l_eta_full.detach())
-                    gradient_accumulation_idx = 0
-                    kl_sum_mb = torch.tensor(0.0, device=device)
-                    kl_count_mb = torch.tensor(0.0, device=device)
+                        value_loss = torch.zeros((), device=device)
+
+                    entropy = torch.distributions.Categorical(
+                        logits=new_logits
+                    ).entropy()
+                    entropy_mean = (entropy * mask_valid_mb).sum() / (
+                        mask_valid_mb.sum() + 1e-8
+                    )
+                    # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
+                    kl_terms_mb = (
+                        logprobs[mini_batch_inds] - new_logprobs
+                    ) * mask_valid_mb
+                    kl_state_mb = kl_terms_mb.sum(dim=1)
+                    kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
+                    total_loss = (
+                        policy_loss
+                        + alpha.detach() * kl_weighted_mb
+                        + args.vf_coef * value_loss
+                    )
+                    self.accelerator.backward(total_loss)
                     optimizer.step()
                     optimizer.zero_grad()
+                    kl_weighted_accum += kl_weighted_mb.detach()
+                    kl_mb_count += 1
+                    pg_loss_stats[vmpo_epoch_idx, minibatch_idx] = policy_loss.detach()
+                    vf_loss_stats[vmpo_epoch_idx, minibatch_idx] = value_loss.detach()
+                    approxkl_stats[vmpo_epoch_idx, minibatch_idx] = (
+                        kl_weighted_mb.detach()
+                    )
+                    entropy_stats[vmpo_epoch_idx, minibatch_idx] = entropy_mean.detach()
+                    vf_clipfrac_stats[vmpo_epoch_idx, minibatch_idx] = torch.zeros(
+                        (), device=device
+                    )
                     minibatch_idx += 1
                     empty_cache()
             with torch.no_grad():
-                mean_kl = kl_seq.mean()
+                if kl_mb_count > 0:
+                    kl_weighted_post = kl_weighted_accum / kl_mb_count
+                    self.alpha_optimizer.zero_grad()
+                    l_alpha = -alpha * (kl_weighted_post - args.eps_alpha)
+                    l_alpha.backward()
+                    self.alpha_optimizer.step()
                 mean_entropy = entropy_tok
-                mean_non_score_reward = non_score_seq.mean()
                 rlhf_reward = reward_seq.mean()
                 eta_value = F.softplus(self.model.eta_raw) + args.eta_min
+                alpha_value = F.softplus(self.model.alpha_raw) + args.alpha_min
+                psi_ess = 1.0 / (psi_global**2).sum().clamp_min(1e-8)
+                psi_max = psi_global.max()
                 l_eta_mean = (
                     torch.stack(l_eta_full_values).mean()
                     if len(l_eta_full_values) > 0
                     else torch.zeros((), device=device)
                 )
                 metrics = {}
-                metrics["objective/kl_ref_seq"] = (
-                    self.accelerator.gather_for_metrics(kl_seq).mean().item()
+                metrics["objective/kl_ref_weighted"] = (
+                    self.accelerator.gather_for_metrics(kl_weighted_states)
+                    .mean()
+                    .item()
                 )
-                metrics["objective/kl_ref_tok"] = (
-                    self.accelerator.gather_for_metrics(kl_tok).mean().item()
+                metrics["psi/ess"] = (
+                    self.accelerator.gather_for_metrics(psi_ess).mean().item()
                 )
-                metrics["objective/kl_ref"] = (
-                    self.accelerator.gather_for_metrics(mean_kl).mean().item()
+                metrics["psi/max"] = (
+                    self.accelerator.gather_for_metrics(psi_max).mean().item()
                 )
                 metrics["objective/entropy_seq"] = (
                     self.accelerator.gather_for_metrics(entropy_seq).mean().item()
@@ -1400,17 +1462,6 @@ class VMPOTrainer(BaseTrainer):
                 )
                 metrics["objective/entropy"] = (
                     self.accelerator.gather_for_metrics(mean_entropy).mean().item()
-                )
-                metrics["objective/non_score_reward_seq"] = (
-                    self.accelerator.gather_for_metrics(non_score_seq).mean().item()
-                )
-                metrics["objective/non_score_reward_tok"] = (
-                    self.accelerator.gather_for_metrics(non_score_tok).mean().item()
-                )
-                metrics["objective/non_score_reward"] = (
-                    self.accelerator.gather_for_metrics(mean_non_score_reward)
-                    .mean()
-                    .item()
                 )
                 metrics["objective/rlhf_reward_seq"] = (
                     self.accelerator.gather_for_metrics(reward_seq).mean().item()
@@ -1439,6 +1490,9 @@ class VMPOTrainer(BaseTrainer):
                 metrics["dual/eta_value"] = (
                     self.accelerator.gather_for_metrics(eta_value).mean().item()
                 )
+                metrics["dual/alpha_value"] = (
+                    self.accelerator.gather_for_metrics(alpha_value).mean().item()
+                )
                 metrics["dual/l_eta_mean"] = (
                     self.accelerator.gather_for_metrics(l_eta_mean).mean().item()
                 )
@@ -1464,12 +1518,9 @@ class VMPOTrainer(BaseTrainer):
                 )
             del (
                 kl,
-                mean_kl,
                 mean_entropy,
-                mean_non_score_reward,
                 scores,
                 metrics,
-                non_score_reward,
             )
             empty_cache()
             gc.collect()
