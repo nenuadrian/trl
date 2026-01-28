@@ -1003,6 +1003,10 @@ class VMPOTrainer(BaseTrainer):
         dataloader = self.dataloader
         accelerator = self.accelerator
         device = accelerator.device
+        model = self.model
+        ref_policy = self.ref_model
+        reward_model = self.reward_model
+        optimizer = self.optimizer
 
         def repeat_generator():
             while True:
