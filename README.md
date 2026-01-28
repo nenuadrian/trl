@@ -68,6 +68,12 @@ git clone https://github.com/huggingface/trl.git
 
 For more flexibility and control over training, TRL provides dedicated trainer classes to post-train language models or PEFT adapters on a custom dataset. Each trainer in TRL is a light wrapper around the 🤗 Transformers trainer and natively supports distributed training methods like DDP, DeepSpeed ZeRO, and FSDP.
 
+### VMPO
+
+```bash
+ython examples/scripts/vmpo.py  --dataset_name trl-internal-testing/descriptiveness-sentiment-trl-style  --dataset_train_split descriptiveness  --learning_rate 3e-6  --num_vmpo_epochs 1  --num_mini_batches 1  --output_dir models/minimal/ppo  --per_device_train_batch_size 64  --gradient_accumulation_steps 1  --total_episodes 10000  --model_name_or_path EleutherAI/pythia-1b-deduped  --sft_model_path EleutherAI/pythia-1b-deduped  --reward_model_path EleutherAI/pythia-1b-deduped  --missing_eos_penalty 1.0
+```
+
 ### `SFTTrainer`
 
 Here is a basic example of how to use the [`SFTTrainer`](https://huggingface.co/docs/trl/sft_trainer):

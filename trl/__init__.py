@@ -85,6 +85,8 @@ _import_structure = {
         "PPOTrainer",  # deprecated import
         "PRMConfig",  # deprecated import
         "PRMTrainer",  # deprecated import
+        "VMPOConfig",
+        "VMPOTrainer",
         "RewardConfig",
         "RewardTrainer",
         "RichProgressCallback",
