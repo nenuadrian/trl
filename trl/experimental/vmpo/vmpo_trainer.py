@@ -886,7 +886,7 @@ class VMPOTrainer(BaseTrainer):
         self.optimizer.param_groups = [
             g for g in self.optimizer.param_groups if len(g["params"]) > 0
         ]
-        eta_lr = self.args.learning_rate * 1.0
+        eta_lr = self.args.learning_rate
         alpha_lr = self.args.learning_rate
         self.eta_optimizer = torch.optim.Adam(
             [self.model.eta_raw],
@@ -1062,9 +1062,13 @@ class VMPOTrainer(BaseTrainer):
             "do_sample": True,
         }
         generation_config = GenerationConfig(**generation_kwargs)
+        generation_config.eos_token_id = processing_class.eos_token_id
+        generation_config.pad_token_id = processing_class.pad_token_id
+        assert generation_config.eos_token_id is not None
+        assert generation_config.pad_token_id is not None
+        assert generation_config.eos_token_id != generation_config.pad_token_id
 
         accelerator.print("===training policy===")
-        start_time = time.time()
         stats_shape = (
             args.num_vmpo_epochs,
             args.num_mini_batches,
@@ -1075,7 +1079,6 @@ class VMPOTrainer(BaseTrainer):
         vf_loss_stats = torch.zeros(stats_shape, device=device)
         vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
         entropy_stats = torch.zeros(stats_shape, device=device)
-        kl_old_new_stats = torch.zeros(stats_shape, device=device)
         model.train()
 
         # trainer state initialization
@@ -1120,7 +1123,6 @@ class VMPOTrainer(BaseTrainer):
             vf_loss_stats.zero_()
             vf_clipfrac_stats.zero_()
             entropy_stats.zero_()
-            kl_old_new_stats.zero_()
             l_eta_full_values: list[torch.Tensor] = []  # track temperature dual terms
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
@@ -1592,12 +1594,17 @@ class VMPOTrainer(BaseTrainer):
         processing_class = self.processing_class
         generation_kwargs = {
             "max_new_tokens": args.response_length,
-            "temperature": (0.01 + 1e-7),
+            "temperature": (args.temperature + 1e-7),
             "top_k": 0.0,
             "top_p": 1.0,
             "do_sample": True,
         }
         generation_config = GenerationConfig(**generation_kwargs)
+        generation_config.eos_token_id = processing_class.eos_token_id
+        generation_config.pad_token_id = processing_class.pad_token_id
+        assert generation_config.eos_token_id is not None
+        assert generation_config.pad_token_id is not None
+        assert generation_config.eos_token_id != generation_config.pad_token_id
 
         table = defaultdict(list)
         with unwrap_model_for_generation(
