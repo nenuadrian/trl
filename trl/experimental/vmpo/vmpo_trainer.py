@@ -1370,30 +1370,6 @@ class VMPOTrainer(BaseTrainer):
                     optimizer.step()
                     optimizer.zero_grad()
                     minibatch_idx += 1
-                    del (
-                        output,
-                        vpred_temp,
-                        logits,
-                        new_logprobs,
-                        vpred,
-                        vpredclipped,
-                        vf_losses1,
-                        vf_losses2,
-                        vf_loss,
-                        vf_clipfrac,
-                        prob_dist,
-                        entropy_token,
-                        entropy_mean,
-                        approxkl,
-                        approxkl_mean,
-                        logprobs_diff,
-                        alpha,
-                        loss_alpha_mb,
-                        kl_sum_mb,
-                        kl_count_mb,
-                        kl_mean_mb,
-                        num_microbatches_in_minibatch,
-                    )
                     empty_cache()
             with torch.no_grad():
                 mean_kl = kl_seq.mean()
