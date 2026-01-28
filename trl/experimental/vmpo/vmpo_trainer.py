@@ -127,10 +127,6 @@ class VMPOConfig(TrainingArguments):
             Path to the reward model.
         value_clip (`float`, *optional*, defaults to `0.2`):
             Clip range for value targets (±value_clip).
-        beta_entropy (`float`, *optional*, defaults to `0.01`):
-            Entropy regularization coefficient.
-        beta_entropy_decay (`float`, *optional*, defaults to `0.0`):
-            Exponential decay rate k for entropy coefficient: beta_t = beta0 * exp(-k * t). Set 0 to disable.
 
     """
 
@@ -342,16 +338,6 @@ class VMPOConfig(TrainingArguments):
     vf_coef: float = field(
         default=0.1,
         metadata={"help": "Value function coefficient."},
-    )
-    beta_entropy: float = field(
-        default=0.01,
-        metadata={"help": "Entropy regularization coefficient."},
-    )
-    beta_entropy_decay: float = field(
-        default=0.0,
-        metadata={
-            "help": "Exponential decay rate k for entropy coefficient: beta_t = beta0 * exp(-k * t). Set 0 to disable."
-        },
     )
     value_clip: float = field(
         default=0.2,
@@ -1064,7 +1050,6 @@ class VMPOTrainer(BaseTrainer):
         pg_loss_stats = torch.zeros(stats_shape, device=device)
         vf_loss_stats = torch.zeros(stats_shape, device=device)
         vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
-        entropy_stats = torch.zeros(stats_shape, device=device)
         model.train()
 
         # trainer state initialization
@@ -1108,7 +1093,6 @@ class VMPOTrainer(BaseTrainer):
             pg_loss_stats.zero_()
             vf_loss_stats.zero_()
             vf_clipfrac_stats.zero_()
-            entropy_stats.zero_()
             l_eta_full_values: list[torch.Tensor] = []  # track temperature dual terms
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
@@ -1397,7 +1381,6 @@ class VMPOTrainer(BaseTrainer):
                     entropy_seq = (entropy * mask_valid_mb).sum(dim=1) / (
                         mask_valid_mb.sum(dim=1) + 1e-8
                     )
-                    entropy_mean = (psi_state_mb * entropy_seq).sum()
                     # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
                     kl_terms_mb = (
                         logprobs[mini_batch_inds] - new_logprobs
@@ -1407,14 +1390,10 @@ class VMPOTrainer(BaseTrainer):
                     )
                     kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
                     alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-                    beta_entropy = args.beta_entropy * math.exp(
-                        -args.beta_entropy_decay * (update - 1)
-                    )
                     total_loss = (
                         policy_loss
                         + alpha.detach() * kl_weighted_mb
                         + args.vf_coef * value_loss
-                        - beta_entropy * entropy_mean
                     )
                     self.accelerator.backward(total_loss)
                     optimizer.step()
@@ -1430,7 +1409,6 @@ class VMPOTrainer(BaseTrainer):
                     approxkl_stats[vmpo_epoch_idx, minibatch_idx] = (
                         kl_weighted_mb.detach()
                     )
-                    entropy_stats[vmpo_epoch_idx, minibatch_idx] = entropy_mean.detach()
                     vf_clipfrac_stats[vmpo_epoch_idx, minibatch_idx] = torch.zeros(
                         (), device=device
                     )
@@ -1498,9 +1476,6 @@ class VMPOTrainer(BaseTrainer):
                 )
                 metrics["val/clipfrac_avg"] = (
                     self.accelerator.gather_for_metrics(vf_clipfrac_stats).mean().item()
-                )
-                metrics["policy/entropy_avg"] = (
-                    self.accelerator.gather_for_metrics(entropy_stats).mean().item()
                 )
                 metrics["dual/eta_grad_norm"] = eta_grad_norm
                 metrics["dual/eta_value"] = (
