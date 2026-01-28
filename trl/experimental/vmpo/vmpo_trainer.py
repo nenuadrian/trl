@@ -717,22 +717,9 @@ class VMPOTrainer(BaseTrainer):
         if data_collator is None:
             data_collator = DataCollatorWithPadding(self.processing_class)
 
-        # Handle stop token settings: update policy model's generation_config to use provided stop token
-        if args.stop_token and args.stop_token_id:
-            raise ValueError("You cannot set both `stop_token` and `stop_token_id`.")
-        elif args.stop_token:
-            if args.stop_token == "eos":
-                self.policy_model.generation_config.eos_token_id = (
-                    self.stop_token_id
-                ) = processing_class.eos_token_id
-            else:
-                raise ValueError(
-                    f"Unknown `stop_token` {args.stop_token}. Allowed values are: `'eos'` and `None` (no stop token)."
-                )
-        else:
-            self.policy_model.generation_config.eos_token_id = self.stop_token_id = (
-                args.stop_token_id
-            )  # None or int
+        # Force a single EOS definition based on the tokenizer
+        self.stop_token_id = processing_class.eos_token_id
+        self.policy_model.generation_config.eos_token_id = self.stop_token_id
 
         # Check that the kl estimator is valid
         if self.args.kl_estimator not in {"k1", "k3"}:
@@ -1012,14 +999,9 @@ class VMPOTrainer(BaseTrainer):
 
     def train(self):
         args = self.args
-        accelerator = self.accelerator
-        optimizer = self.optimizer
-        model = self.model
-        ref_policy = self.ref_model
-        reward_model = self.reward_model
         processing_class = self.processing_class
         dataloader = self.dataloader
-        device = accelerator.device
+        device = self.accelerator.device
 
         def repeat_generator():
             while True:
@@ -1034,7 +1016,8 @@ class VMPOTrainer(BaseTrainer):
             "do_sample": True,
         }
         generation_config = GenerationConfig(**generation_kwargs)
-        generation_config.eos_token_id = processing_class.eos_token_id
+        eos_id = self.stop_token_id
+        generation_config.eos_token_id = eos_id
         generation_config.pad_token_id = processing_class.pad_token_id
         assert generation_config.eos_token_id is not None
         assert generation_config.pad_token_id is not None
@@ -1206,9 +1189,7 @@ class VMPOTrainer(BaseTrainer):
 
                 # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
                 # Completions not passing that filter will receive a lower score.
-                contain_eos_token = (
-                    postprocessed_responses == processing_class.eos_token_id
-                ).any(dim=1)
+                contain_eos_token = (postprocessed_responses == eos_id).any(dim=1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token] -= self.args.missing_eos_penalty
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
@@ -1248,10 +1229,6 @@ class VMPOTrainer(BaseTrainer):
                 )
                 rewards[actual_start, actual_end] += scores
                 # logging masks/summaries
-                valid_tok_mask = ~padding_mask
-                valid_tok_count = valid_tok_mask.sum(1)
-                entropy_seq = -(logprobs.masked_fill(padding_mask, 0)).sum(1)
-                entropy_tok = entropy_seq.sum() / (valid_tok_count.sum() + 1e-8)
                 reward_valid_mask = ~padding_mask_p1
                 reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
                 reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
@@ -1282,7 +1259,10 @@ class VMPOTrainer(BaseTrainer):
             alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
             # sequence-level ψ: aggregate advantages per sequence before weighting
             mask_valid = ~padding_mask
-            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1)
+            valid_len = mask_valid.sum(dim=1).clamp_min(1)
+            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(
+                dim=1
+            ) / valid_len
             adv_seq_eta = adv_seq
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
@@ -1375,12 +1355,6 @@ class VMPOTrainer(BaseTrainer):
                     else:
                         value_loss = torch.zeros((), device=device)
 
-                    entropy = torch.distributions.Categorical(
-                        logits=new_logits
-                    ).entropy()
-                    entropy_seq = (entropy * mask_valid_mb).sum(dim=1) / (
-                        mask_valid_mb.sum(dim=1) + 1e-8
-                    )
                     # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
                     kl_terms_mb = (
                         logprobs[mini_batch_inds] - new_logprobs
@@ -1422,12 +1396,13 @@ class VMPOTrainer(BaseTrainer):
                     kl_weighted_post = torch.zeros((), device=device)
             # removed redundant post-epoch alpha update
             with torch.no_grad():
-                mean_entropy = entropy_tok
                 rlhf_reward = reward_seq.mean()
                 eta_value = F.softplus(self.model.eta_raw) + args.eta_min
                 alpha_value = F.softplus(self.model.alpha_raw) + args.alpha_min
-                psi_ess = 1.0 / (psi_global**2).sum().clamp_min(1e-8)
-                psi_max = psi_global.max()
+                psi_state = psi_global.sum(dim=1)
+                psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
+                psi_ess = 1.0 / (psi_state**2).sum().clamp_min(1e-8)
+                psi_max = psi_state.max()
                 l_eta_mean = (
                     torch.stack(l_eta_full_values).mean()
                     if len(l_eta_full_values) > 0
@@ -1445,15 +1420,6 @@ class VMPOTrainer(BaseTrainer):
                 )
                 metrics["psi/max"] = (
                     self.accelerator.gather_for_metrics(psi_max).mean().item()
-                )
-                metrics["objective/entropy_seq"] = (
-                    self.accelerator.gather_for_metrics(entropy_seq).mean().item()
-                )
-                metrics["objective/entropy_tok"] = (
-                    self.accelerator.gather_for_metrics(entropy_tok).mean().item()
-                )
-                metrics["objective/entropy"] = (
-                    self.accelerator.gather_for_metrics(mean_entropy).mean().item()
                 )
                 metrics["objective/rlhf_reward_seq"] = (
                     self.accelerator.gather_for_metrics(reward_seq).mean().item()
@@ -1507,7 +1473,6 @@ class VMPOTrainer(BaseTrainer):
                 )
             del (
                 kl,
-                mean_entropy,
                 scores,
                 metrics,
             )
@@ -1563,7 +1528,8 @@ class VMPOTrainer(BaseTrainer):
             "do_sample": True,
         }
         generation_config = GenerationConfig(**generation_kwargs)
-        generation_config.eos_token_id = processing_class.eos_token_id
+        eos_id = self.stop_token_id
+        generation_config.eos_token_id = eos_id
         generation_config.pad_token_id = processing_class.pad_token_id
         assert generation_config.eos_token_id is not None
         assert generation_config.pad_token_id is not None
@@ -1593,7 +1559,7 @@ class VMPOTrainer(BaseTrainer):
                         self.stop_token_id is not None
                     ):  # handle the edge case when stop_token_id exists but is 0
                         postprocessed_response = truncate_response(
-                            self.stop_token_id, processing_class.pad_token_id, response
+                            eos_id, processing_class.pad_token_id, response
                         )
                     table["query"].extend(
                         gather_object(
