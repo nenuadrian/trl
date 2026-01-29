@@ -50,7 +50,6 @@ from ...trainer.utils import (
     empty_cache,
     log_table_to_comet_experiment,
     pad,
-    prepare_deepspeed,
     selective_log_softmax,
 )
 from ..utils import first_true_indices, get_reward
@@ -115,8 +114,6 @@ class VMPOConfig(TrainingArguments):
             `gradient_accumulation_steps`).
         local_mini_batch_size (`int`, *optional*):
             Mini batch size per GPU.
-        mini_batch_size (`int`, *optional*):
-            Mini batch size across GPUs.
         push_to_hub (`bool`, *optional*, defaults to `False`):
             Whether to push the model to the Hub after training.
         exp_name (`str`, *optional*, defaults to `os.path.basename(__file__)[:-3]`):
@@ -139,6 +136,12 @@ class VMPOConfig(TrainingArguments):
     eta_min: float = field(
         default=1e-4,
         metadata={"help": "Minimum value added after softplus to keep η positive."},
+    )
+    eta_inner_steps: int = field(
+        default=10,
+        metadata={
+            "help": "Number of inner optimization steps for the temperature dual variable η."
+        },
     )
     eps_alpha: float = field(
         default=0.01,
@@ -282,10 +285,6 @@ class VMPOConfig(TrainingArguments):
     local_mini_batch_size: int | None = field(
         default=None,
         metadata={"help": "Mini batch size per GPU."},
-    )
-    mini_batch_size: int | None = field(
-        default=None,
-        metadata={"help": "Mini batch size across GPUs."},
     )
     push_to_hub: bool = field(
         default=False,
@@ -773,11 +772,6 @@ class VMPOTrainer(BaseTrainer):
         )
         args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
         args.batch_size = int(args.local_batch_size * args.world_size)
-        args.mini_batch_size = exact_div(
-            args.batch_size,
-            args.num_mini_batches,
-            "`batch_size` must be a multiple of `num_mini_batches`",
-        )
         args.local_mini_batch_size = exact_div(
             args.local_batch_size,
             args.num_mini_batches,
@@ -876,9 +870,6 @@ class VMPOTrainer(BaseTrainer):
         )
         self.current_flos = 0
         self.hp_search_backend = None
-        self.is_deepspeed_enabled = (
-            getattr(self.accelerator.state, "deepspeed_plugin", None) is not None
-        )
         self.is_fsdp_enabled = (
             getattr(self.accelerator.state, "fsdp_plugin", None) is not None
         )
@@ -919,35 +910,12 @@ class VMPOTrainer(BaseTrainer):
         )  # no need to shuffle eval dataset
         self.eval_dataloader = accelerator.prepare(self.eval_dataloader)
 
-        if self.is_deepspeed_enabled:
-            self.reward_model = prepare_deepspeed(
-                self.reward_model,
-                args.per_device_train_batch_size,
-                args.fp16,
-                args.bf16,
-            )
-
-            if self.ref_model is None:
-                if not self.is_peft_model:
-                    raise ValueError(
-                        "No reference model and model is not a Peft model."
-                    )
-            else:
-                self.ref_model = prepare_deepspeed(
-                    self.ref_model,
-                    args.per_device_train_batch_size,
-                    args.fp16,
-                    args.bf16,
-                )
+        if self.ref_model is None:
+            if not self.is_peft_model:
+                raise ValueError("No reference model and model is not a Peft model.")
         else:
-            if self.ref_model is None:
-                if not self.is_peft_model:
-                    raise ValueError(
-                        "No reference model and model is not a Peft model."
-                    )
-            else:
-                self.ref_model = self.ref_model.to(self.accelerator.device)
-            self.reward_model = self.reward_model.to(self.accelerator.device)
+            self.ref_model = self.ref_model.to(self.accelerator.device)
+        self.reward_model = self.reward_model.to(self.accelerator.device)
 
     def get_train_dataloader(self) -> DataLoader:
         return self.dataloader
@@ -973,16 +941,9 @@ class VMPOTrainer(BaseTrainer):
         backup_model = self.model
         self.model = self.model.policy  # save only the policy
 
-        if self.is_deepspeed_enabled:
-            backup_deepspeed = self.deepspeed
-            self.deepspeed = self.model
-
         super().save_model(output_dir, _internal_call)
 
         self.model = backup_model
-
-        if self.is_deepspeed_enabled:
-            self.deepspeed = backup_deepspeed
 
     def train(self):
         args = self.args
@@ -1057,17 +1018,11 @@ class VMPOTrainer(BaseTrainer):
             args, self.state, self.control
         )
 
-        # backward compatibility
-        if self.is_deepspeed_enabled:
-            self.deepspeed = self.model
-            self.model_wrapped = self.model
-
         for update in range(1, args.num_total_batches + 1):
             approxkl_stats.zero_()
             pg_loss_stats.zero_()
             vf_loss_stats.zero_()
             vf_clipfrac_stats.zero_()
-            l_eta_full_values: list[torch.Tensor] = []  # track temperature dual terms
             self.state.episode += 1 * args.batch_size
             data = next(iter_dataloader)
             with torch.no_grad():
@@ -1260,34 +1215,9 @@ class VMPOTrainer(BaseTrainer):
                 empty_cache()
 
             # Global E-step (compute ψ once per rollout and update η/α)
-            mask_valid = ~padding_mask_p1
-            valid_len = mask_valid.sum(dim=1).clamp_min(1)
-            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(
-                dim=1
-            ) / valid_len
-            num_seqs = adv_seq.numel()
-            psi_global = torch.zeros_like(raw_advantages)
-            l_eta_full_values = []
-            eta_inner_steps = 10
-            for _ in range(eta_inner_steps):
-                eta = F.softplus(self.model.eta_raw) + args.eta_min
-                l_eta = torch.zeros((), device=device)
-                if num_seqs > 0:
-                    max_adv = adv_seq.max()
-                    w_seq = torch.exp((adv_seq - max_adv) / (eta + 1e-8))
-                    psi_seq = w_seq / w_seq.sum().clamp_min(1e-8)
-                    psi_global = psi_seq[:, None] * mask_valid
-                    log_mean_exp = torch.logsumexp(
-                        adv_seq / (eta + 1e-8), dim=0
-                    ) - math.log(num_seqs)
-                    l_eta = eta * (args.eps_eta + log_mean_exp)
-                self.eta_optimizer.zero_grad()
-                if l_eta.requires_grad:
-                    l_eta.backward()
-                    self.eta_optimizer.step()
-                    l_eta_full_values.append(l_eta.detach())
-                else:
-                    break
+            psi_global, l_eta_full_values = self.e_step_dual_update(
+                logprobs, padding_mask_p1, args, device
+            )
             # detach ψ before policy/value updates to avoid in-place versioning issues
             psi_global = psi_global.detach()
             psi_state = psi_global.sum(dim=1)
@@ -1296,157 +1226,97 @@ class VMPOTrainer(BaseTrainer):
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
             b_inds = np.random.permutation(args.local_batch_size)
-            minibatch_idx = 0
-            for mini_batch_start in range(
-                0, args.local_batch_size, args.local_mini_batch_size
-            ):
-                mini_batch_end = mini_batch_start + args.local_mini_batch_size
-                mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
 
-                mb_query = queries[mini_batch_inds]
-                mb_response = responses[mini_batch_inds]
-                mb_query_response = torch.cat((mb_query, mb_response), 1)
-                psi_mb = psi_global[mini_batch_inds]
-                psi_state_mb = psi_state[mini_batch_inds]
-                mask_valid_mb = ~padding_mask_p1[mini_batch_inds]
+            mb_query = queries[b_inds]
+            mb_response = responses[b_inds]
+            mb_query_response = torch.cat((mb_query, mb_response), 1)
+            psi_mb = psi_global[b_inds]
+            psi_state_mb = psi_state[b_inds]
+            mask_valid_mb = ~padding_mask_p1[b_inds]
 
-                policy_outputs = forward(
-                    model.policy,
-                    mb_query_response,
-                    processing_class.pad_token_id,
-                )
-                new_logits = policy_outputs.logits[:, context_length - 1 : -1]
-                new_logprobs = selective_log_softmax(new_logits, mb_response)
+            policy_outputs = forward(
+                model.policy,
+                mb_query_response,
+                processing_class.pad_token_id,
+            )
+            new_logits = policy_outputs.logits[:, context_length - 1 : -1]
+            new_logprobs = selective_log_softmax(new_logits, mb_response)
 
-                if psi_mb.sum() > 0:
-                    policy_loss = -(
-                        (psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8)
-                    )
-                else:
-                    policy_loss = torch.zeros((), device=device)
+            if psi_mb.sum() > 0:
+                policy_loss = -((psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8))
+            else:
+                policy_loss = torch.zeros((), device=device)
 
-                value_full, _, _ = get_reward(
-                    self.accelerator.unwrap_model(model).value_model,
-                    mb_query_response,
-                    processing_class.pad_token_id,
-                    context_length,
-                )
-                value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
-                value_mask = ~padding_mask_p1[mini_batch_inds]
-                with torch.no_grad():
-                    value_old_mb = values[mini_batch_inds]
-                    returns_mb = returns[mini_batch_inds]
-                    delta = (returns_mb - value_old_mb).clamp(
-                        -args.value_clip, args.value_clip
-                    )
-                    value_target = value_old_mb + delta
-                if value_mask.any():
-                    value_loss = F.mse_loss(
-                        value_pred[value_mask],
-                        value_target[value_mask],
-                    )
-                else:
-                    value_loss = torch.zeros((), device=device)
-
-                # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
-                kl_terms_mb = (logprobs[mini_batch_inds] - new_logprobs) * mask_valid_mb
-                kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
-                kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
-                alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-                total_loss = (
-                    policy_loss
-                    + alpha.detach() * kl_weighted_mb
-                    + args.vf_coef * value_loss
-                )
-                self.accelerator.backward(total_loss)
-                optimizer.step()
-                optimizer.zero_grad()
-                kl_weighted_accum += kl_weighted_mb.detach()
-                kl_mb_count += 1
-                self.alpha_optimizer.zero_grad()
-                l_alpha_mb = -alpha * (kl_weighted_mb.detach() - args.eps_alpha)
-                l_alpha_mb.backward()
-                self.alpha_optimizer.step()
-                pg_loss_stats[minibatch_idx] = policy_loss.detach()
-                vf_loss_stats[minibatch_idx] = value_loss.detach()
-                approxkl_stats[minibatch_idx] = kl_weighted_mb.detach()
-                vf_clipfrac_stats[minibatch_idx] = torch.zeros((), device=device)
-                minibatch_idx += 1
-                empty_cache()
-            # removed delayed α update; trust region is enforced per minibatch
+            value_full, _, _ = get_reward(
+                self.accelerator.unwrap_model(model).value_model,
+                mb_query_response,
+                processing_class.pad_token_id,
+                context_length,
+            )
+            value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
+            value_mask = ~padding_mask_p1[b_inds]
             with torch.no_grad():
-                if kl_mb_count > 0:
-                    kl_weighted_post = kl_weighted_accum / kl_mb_count
-                else:
-                    kl_weighted_post = torch.zeros((), device=device)
-            # removed redundant post-epoch alpha update
-            with torch.no_grad():
-                rlhf_reward = reward_seq.mean()
-                eta_value = F.softplus(self.model.eta_raw) + args.eta_min
-                alpha_value = F.softplus(self.model.alpha_raw) + args.alpha_min
-                psi_state = psi_global.sum(dim=1)
-                psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
-                psi_ess = 1.0 / (psi_state**2).sum().clamp_min(1e-8)
-                psi_max = psi_state.max()
-                l_eta_mean = (
-                    torch.stack(l_eta_full_values).mean()
-                    if len(l_eta_full_values) > 0
-                    else torch.zeros((), device=device)
+                value_old_mb = values[b_inds]
+                returns_mb = returns[b_inds]
+                delta = (returns_mb - value_old_mb).clamp(
+                    -args.value_clip, args.value_clip
                 )
-                eta_grad = self.model.eta_raw.grad
-                eta_grad_norm = eta_grad.norm().item() if eta_grad is not None else 0.0
-                metrics = {}
-                # psi_state already computed above
-                metrics["objective/kl_ref_weighted"] = (
-                    self.accelerator.gather_for_metrics(kl_weighted_post).mean().item()
+                value_target = value_old_mb + delta
+            if value_mask.any():
+                value_loss = F.mse_loss(
+                    value_pred[value_mask],
+                    value_target[value_mask],
                 )
-                metrics["psi/ess"] = (
-                    self.accelerator.gather_for_metrics(psi_ess).mean().item()
+            else:
+                value_loss = torch.zeros((), device=device)
+
+            # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
+            kl_terms_mb = (logprobs[b_inds] - new_logprobs) * mask_valid_mb
+            kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
+            kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
+            alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
+            total_loss = (
+                policy_loss
+                + alpha.detach() * kl_weighted_mb
+                + args.vf_coef * value_loss
+            )
+            self.accelerator.backward(total_loss)
+            optimizer.step()
+            optimizer.zero_grad()
+            kl_weighted_accum += kl_weighted_mb.detach()
+            kl_mb_count += 1
+            self.alpha_optimizer.zero_grad()
+            l_alpha_mb = -alpha * (kl_weighted_mb.detach() - args.eps_alpha)
+            l_alpha_mb.backward()
+            self.alpha_optimizer.step()
+            pg_loss_stats[0] = policy_loss.detach()
+            vf_loss_stats[0] = value_loss.detach()
+            approxkl_stats[0] = kl_weighted_mb.detach()
+            vf_clipfrac_stats[0] = torch.zeros((), device=device)
+            empty_cache()
+
+            self.state.epoch = (
+                self.state.episode / self.train_dataset_len
+            )  # used by self.log
+            self.state.global_step += 1
+            self.log(
+                self.generate_metrics(
+                    kl_mb_count,
+                    kl_weighted_accum,
+                    reward_seq,
+                    reward_tok,
+                    psi_global,
+                    l_eta_full_values,
+                    scores,
+                    approxkl_stats,
+                    pg_loss_stats,
+                    vf_loss_stats,
+                    vf_clipfrac_stats,
+                    contain_eos_token_raw,
+                    contain_eos_token_post,
+                    device,
                 )
-                metrics["psi/max"] = (
-                    self.accelerator.gather_for_metrics(psi_max).mean().item()
-                )
-                metrics["objective/rlhf_reward_seq"] = (
-                    self.accelerator.gather_for_metrics(reward_seq).mean().item()
-                )
-                metrics["objective/rlhf_reward_tok"] = (
-                    self.accelerator.gather_for_metrics(reward_tok).mean().item()
-                )
-                metrics["objective/rlhf_reward"] = (
-                    self.accelerator.gather_for_metrics(rlhf_reward).mean().item()
-                )
-                metrics["debug/reward_std"] = scores.std().item()
-                metrics["policy/approxkl_avg"] = (
-                    self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
-                )
-                metrics["loss/policy_avg"] = (
-                    self.accelerator.gather_for_metrics(pg_loss_stats).mean().item()
-                )
-                metrics["loss/value_avg"] = (
-                    self.accelerator.gather_for_metrics(vf_loss_stats).mean().item()
-                )
-                metrics["val/clipfrac_avg"] = (
-                    self.accelerator.gather_for_metrics(vf_clipfrac_stats).mean().item()
-                )
-                metrics["dual/eta_grad_norm"] = eta_grad_norm
-                metrics["dual/eta_value"] = (
-                    self.accelerator.gather_for_metrics(eta_value).mean().item()
-                )
-                metrics["dual/alpha_value"] = (
-                    self.accelerator.gather_for_metrics(alpha_value).mean().item()
-                )
-                metrics["dual/l_eta_mean"] = (
-                    self.accelerator.gather_for_metrics(l_eta_mean).mean().item()
-                )
-                metrics["val/num_eos_tokens_raw"] = contain_eos_token_raw.sum().item()
-                metrics["val/num_eos_tokens"] = contain_eos_token_post.sum().item()
-                metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
-                metrics["episode"] = self.state.episode
-                self.state.epoch = (
-                    self.state.episode / self.train_dataset_len
-                )  # used by self.log
-                self.state.global_step += 1
-                self.log(metrics)
+            )
 
             self.lr_scheduler.step()
             self.control = self.callback_handler.on_step_end(
@@ -1460,7 +1330,6 @@ class VMPOTrainer(BaseTrainer):
             del (
                 kl,
                 scores,
-                metrics,
             )
             empty_cache()
             gc.collect()
@@ -1494,6 +1363,126 @@ class VMPOTrainer(BaseTrainer):
             self.control = self.callback_handler.on_save(
                 self.args, self.state, self.control
             )
+
+    def e_step_dual_update(
+        self,
+        padding_mask_p1: torch.Tensor,
+        raw_advantages: torch.Tensor,
+        args,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, list]:
+        mask_valid = ~padding_mask_p1
+        valid_len = mask_valid.sum(dim=1).clamp_min(1)
+        adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1) / valid_len
+        num_seqs = adv_seq.numel()
+        psi_global = torch.zeros_like(raw_advantages)
+        l_eta_full_values = []
+        for _ in range(args.eta_inner_steps):
+            eta = F.softplus(self.model.eta_raw) + args.eta_min
+            l_eta = torch.zeros((), device=device)
+            if num_seqs > 0:
+                max_adv = adv_seq.max()
+                w_seq = torch.exp((adv_seq - max_adv) / (eta + 1e-8))
+                psi_seq = w_seq / w_seq.sum().clamp_min(1e-8)
+                psi_global = psi_seq[:, None] * mask_valid
+                log_mean_exp = torch.logsumexp(
+                    adv_seq / (eta + 1e-8), dim=0
+                ) - math.log(num_seqs)
+                l_eta = eta * (args.eps_eta + log_mean_exp)
+            self.eta_optimizer.zero_grad()
+            if l_eta.requires_grad:
+                l_eta.backward()
+                self.eta_optimizer.step()
+                l_eta_full_values.append(l_eta.detach())
+            else:
+                break
+        return psi_global, l_eta_full_values
+
+    def generate_metrics(
+        self,
+        kl_mb_count: int,
+        kl_weighted_accum: torch.Tensor,
+        reward_seq: torch.Tensor,
+        reward_tok: torch.Tensor,
+        psi_global: torch.Tensor,
+        l_eta_full_values: list,
+        scores: torch.Tensor,
+        approxkl_stats: torch.Tensor,
+        pg_loss_stats: torch.Tensor,
+        vf_loss_stats: torch.Tensor,
+        vf_clipfrac_stats: torch.Tensor,
+        contain_eos_token_raw: torch.Tensor,
+        contain_eos_token_post: torch.Tensor,
+        device: torch.device,
+    ) -> dict[str, float]:
+        """Generate a dictionary of training metrics for logging."""
+        with torch.no_grad():
+            if kl_mb_count > 0:
+                kl_weighted_post = kl_weighted_accum / kl_mb_count
+            else:
+                kl_weighted_post = torch.zeros((), device=device)
+            rlhf_reward = reward_seq.mean()
+            eta_value = F.softplus(self.model.eta_raw) + args.eta_min
+            alpha_value = F.softplus(self.model.alpha_raw) + args.alpha_min
+            psi_state = psi_global.sum(dim=1)
+            psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
+            psi_ess = 1.0 / (psi_state**2).sum().clamp_min(1e-8)
+            psi_max = psi_state.max()
+            l_eta_mean = (
+                torch.stack(l_eta_full_values).mean()
+                if len(l_eta_full_values) > 0
+                else torch.zeros((), device=device)
+            )
+            eta_grad = self.model.eta_raw.grad
+            eta_grad_norm = eta_grad.norm().item() if eta_grad is not None else 0.0
+            metrics = {}
+            # psi_state already computed above
+            metrics["objective/kl_ref_weighted"] = (
+                self.accelerator.gather_for_metrics(kl_weighted_post).mean().item()
+            )
+            metrics["psi/ess"] = (
+                self.accelerator.gather_for_metrics(psi_ess).mean().item()
+            )
+            metrics["psi/max"] = (
+                self.accelerator.gather_for_metrics(psi_max).mean().item()
+            )
+            metrics["objective/rlhf_reward_seq"] = (
+                self.accelerator.gather_for_metrics(reward_seq).mean().item()
+            )
+            metrics["objective/rlhf_reward_tok"] = (
+                self.accelerator.gather_for_metrics(reward_tok).mean().item()
+            )
+            metrics["objective/rlhf_reward"] = (
+                self.accelerator.gather_for_metrics(rlhf_reward).mean().item()
+            )
+            metrics["debug/reward_std"] = scores.std().item()
+            metrics["policy/approxkl_avg"] = (
+                self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
+            )
+            metrics["loss/policy_avg"] = (
+                self.accelerator.gather_for_metrics(pg_loss_stats).mean().item()
+            )
+            metrics["loss/value_avg"] = (
+                self.accelerator.gather_for_metrics(vf_loss_stats).mean().item()
+            )
+            metrics["val/clipfrac_avg"] = (
+                self.accelerator.gather_for_metrics(vf_clipfrac_stats).mean().item()
+            )
+            metrics["dual/eta_grad_norm"] = eta_grad_norm
+            metrics["dual/eta_value"] = (
+                self.accelerator.gather_for_metrics(eta_value).mean().item()
+            )
+            metrics["dual/alpha_value"] = (
+                self.accelerator.gather_for_metrics(alpha_value).mean().item()
+            )
+            metrics["dual/l_eta_mean"] = (
+                self.accelerator.gather_for_metrics(l_eta_mean).mean().item()
+            )
+            metrics["val/num_eos_tokens_raw"] = contain_eos_token_raw.sum().item()
+            metrics["val/num_eos_tokens"] = contain_eos_token_post.sum().item()
+            metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
+            metrics["episode"] = self.state.episode
+        return metrics
 
     def generate_completions(self, sampling: bool = False):
         args = self.args
