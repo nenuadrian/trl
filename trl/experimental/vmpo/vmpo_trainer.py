@@ -1423,8 +1423,8 @@ class VMPOTrainer(BaseTrainer):
             else:
                 kl_weighted_post = torch.zeros((), device=device)
             rlhf_reward = reward_seq.mean()
-            eta_value = F.softplus(self.model.eta_raw) + args.eta_min
-            alpha_value = F.softplus(self.model.alpha_raw) + args.alpha_min
+            eta_value = F.softplus(self.model.eta_raw) + self.args.eta_min
+            alpha_value = F.softplus(self.model.alpha_raw) + self.args.alpha_min
             psi_state = psi_global.sum(dim=1)
             psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
             psi_ess = 1.0 / (psi_state**2).sum().clamp_min(1e-8)
