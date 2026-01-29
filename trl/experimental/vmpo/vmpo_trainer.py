@@ -1102,7 +1102,7 @@ class VMPOTrainer(BaseTrainer):
             # 4. compute rewards
             # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
             logr = ref_logprobs - logprobs
-            kl = -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr
+            kl = -logr if self.args.kl_estimator == "k1" else (logr.exp() - 1) - logr
             # trust region KL is handled by α; no PPO-style shaping
             rewards = torch.zeros_like(kl)
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
@@ -1118,7 +1118,7 @@ class VMPOTrainer(BaseTrainer):
                 batch_idx = torch.arange(rewards.size(0), device=rewards.device)[
                     has_eos
                 ]
-                rewards[batch_idx, eos_positions[has_eos]] += args.eos_bonus
+                rewards[batch_idx, eos_positions[has_eos]] += self.args.eos_bonus
             # logging masks/summaries
             reward_valid_mask = ~padding_mask_p1
             reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
@@ -1137,9 +1137,9 @@ class VMPOTrainer(BaseTrainer):
             gen_length = responses.shape[1]
             for t in reversed(range(gen_length)):
                 nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-                delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
+                delta = rewards[:, t] + self.args.gamma * nextvalues - values[:, t]
                 not_done = ~padding_mask_p1[:, t]
-                lastgaelam = delta + args.gamma * args.lam * lastgaelam * not_done
+                lastgaelam = delta + self.args.gamma * self.args.lam * lastgaelam * not_done
                 advantages_reversed.append(lastgaelam)
             raw_advantages = torch.stack(advantages_reversed[::-1], axis=1)
             returns = raw_advantages + values
