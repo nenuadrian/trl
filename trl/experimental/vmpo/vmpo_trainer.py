@@ -1276,7 +1276,6 @@ class VMPOTrainer(BaseTrainer):
         model = self.model
         ref_policy = self.ref_model
         reward_model = self.reward_model
-        optimizer = self.optimizer
 
         def repeat_generator():
             while True:
@@ -1289,6 +1288,7 @@ class VMPOTrainer(BaseTrainer):
             "top_k": 0.0,
             "top_p": 1.0,
             "do_sample": True,
+            "early_stopping": True,
         }
         generation_config = GenerationConfig(**generation_kwargs)
         eos_id = self.stop_token_id
@@ -1611,6 +1611,7 @@ class VMPOTrainer(BaseTrainer):
             "top_k": 0.0,
             "top_p": 1.0,
             "do_sample": True,
+            "early_stopping": True,
         }
         generation_config = GenerationConfig(**generation_kwargs)
         eos_id = self.stop_token_id
