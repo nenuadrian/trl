@@ -1366,7 +1366,7 @@ class VMPOTrainer(BaseTrainer):
 
     def e_step_dual_update(
         self,
-        padding_mask_p1: torch.Tensor,
+        padding_mask_p1,
         raw_advantages: torch.Tensor,
         args,
         device: torch.device,
