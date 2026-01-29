@@ -50,7 +50,6 @@ from ...trainer.utils import (
     empty_cache,
     log_table_to_comet_experiment,
     pad,
-    prepare_deepspeed,
     selective_log_softmax,
 )
 from ..utils import first_true_indices, get_reward
@@ -115,8 +114,6 @@ class VMPOConfig(TrainingArguments):
             `gradient_accumulation_steps`).
         local_mini_batch_size (`int`, *optional*):
             Mini batch size per GPU.
-        mini_batch_size (`int`, *optional*):
-            Mini batch size across GPUs.
         push_to_hub (`bool`, *optional*, defaults to `False`):
             Whether to push the model to the Hub after training.
         exp_name (`str`, *optional*, defaults to `os.path.basename(__file__)[:-3]`):
@@ -288,10 +285,6 @@ class VMPOConfig(TrainingArguments):
     local_mini_batch_size: int | None = field(
         default=None,
         metadata={"help": "Mini batch size per GPU."},
-    )
-    mini_batch_size: int | None = field(
-        default=None,
-        metadata={"help": "Mini batch size across GPUs."},
     )
     push_to_hub: bool = field(
         default=False,
@@ -779,11 +772,6 @@ class VMPOTrainer(BaseTrainer):
         )
         args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
         args.batch_size = int(args.local_batch_size * args.world_size)
-        args.mini_batch_size = exact_div(
-            args.batch_size,
-            args.num_mini_batches,
-            "`batch_size` must be a multiple of `num_mini_batches`",
-        )
         args.local_mini_batch_size = exact_div(
             args.local_batch_size,
             args.num_mini_batches,
@@ -1228,10 +1216,11 @@ class VMPOTrainer(BaseTrainer):
 
             # Global E-step (compute ψ once per rollout and update η/α)
             psi_global, l_eta_full_values = self.e_step_dual_update(
-                logprobs,
-                padding_mask_p1,
-                args,
-                device)
+                padding_mask_p1=padding_mask_p1,
+                raw_advantages=raw_advantages,
+                args=args,
+                device=device,
+            )
             # detach ψ before policy/value updates to avoid in-place versioning issues
             psi_global = psi_global.detach()
             psi_state = psi_global.sum(dim=1)
@@ -1240,83 +1229,74 @@ class VMPOTrainer(BaseTrainer):
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
             b_inds = np.random.permutation(args.local_batch_size)
-            minibatch_idx = 0
-            for mini_batch_start in range(
-                0, args.local_batch_size, args.local_mini_batch_size
-            ):
-                mini_batch_end = mini_batch_start + args.local_mini_batch_size
-                mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
 
-                mb_query = queries[mini_batch_inds]
-                mb_response = responses[mini_batch_inds]
-                mb_query_response = torch.cat((mb_query, mb_response), 1)
-                psi_mb = psi_global[mini_batch_inds]
-                psi_state_mb = psi_state[mini_batch_inds]
-                mask_valid_mb = ~padding_mask_p1[mini_batch_inds]
+            mb_query = queries[b_inds]
+            mb_response = responses[b_inds]
+            mb_query_response = torch.cat((mb_query, mb_response), 1)
+            psi_mb = psi_global[b_inds]
+            psi_state_mb = psi_state[b_inds]
+            mask_valid_mb = ~padding_mask_p1[b_inds]
 
-                policy_outputs = forward(
-                    model.policy,
-                    mb_query_response,
-                    processing_class.pad_token_id,
+            policy_outputs = forward(
+                model.policy,
+                mb_query_response,
+                processing_class.pad_token_id,
+            )
+            new_logits = policy_outputs.logits[:, context_length - 1 : -1]
+            new_logprobs = selective_log_softmax(new_logits, mb_response)
+
+            if psi_mb.sum() > 0:
+                policy_loss = -((psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8))
+            else:
+                policy_loss = torch.zeros((), device=device)
+
+            value_full, _, _ = get_reward(
+                self.accelerator.unwrap_model(model).value_model,
+                mb_query_response,
+                processing_class.pad_token_id,
+                context_length,
+            )
+            value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
+            value_mask = ~padding_mask_p1[b_inds]
+            with torch.no_grad():
+                value_old_mb = values[b_inds]
+                returns_mb = returns[b_inds]
+                delta = (returns_mb - value_old_mb).clamp(
+                    -args.value_clip, args.value_clip
                 )
-                new_logits = policy_outputs.logits[:, context_length - 1 : -1]
-                new_logprobs = selective_log_softmax(new_logits, mb_response)
-
-                if psi_mb.sum() > 0:
-                    policy_loss = -(
-                        (psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8)
-                    )
-                else:
-                    policy_loss = torch.zeros((), device=device)
-
-                value_full, _, _ = get_reward(
-                    self.accelerator.unwrap_model(model).value_model,
-                    mb_query_response,
-                    processing_class.pad_token_id,
-                    context_length,
+                value_target = value_old_mb + delta
+            if value_mask.any():
+                value_loss = F.mse_loss(
+                    value_pred[value_mask],
+                    value_target[value_mask],
                 )
-                value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
-                value_mask = ~padding_mask_p1[mini_batch_inds]
-                with torch.no_grad():
-                    value_old_mb = values[mini_batch_inds]
-                    returns_mb = returns[mini_batch_inds]
-                    delta = (returns_mb - value_old_mb).clamp(
-                        -args.value_clip, args.value_clip
-                    )
-                    value_target = value_old_mb + delta
-                if value_mask.any():
-                    value_loss = F.mse_loss(
-                        value_pred[value_mask],
-                        value_target[value_mask],
-                    )
-                else:
-                    value_loss = torch.zeros((), device=device)
+            else:
+                value_loss = torch.zeros((), device=device)
 
-                # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
-                kl_terms_mb = (logprobs[mini_batch_inds] - new_logprobs) * mask_valid_mb
-                kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
-                kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
-                alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-                total_loss = (
-                    policy_loss
-                    + alpha.detach() * kl_weighted_mb
-                    + args.vf_coef * value_loss
-                )
-                self.accelerator.backward(total_loss)
-                optimizer.step()
-                optimizer.zero_grad()
-                kl_weighted_accum += kl_weighted_mb.detach()
-                kl_mb_count += 1
-                self.alpha_optimizer.zero_grad()
-                l_alpha_mb = -alpha * (kl_weighted_mb.detach() - args.eps_alpha)
-                l_alpha_mb.backward()
-                self.alpha_optimizer.step()
-                pg_loss_stats[minibatch_idx] = policy_loss.detach()
-                vf_loss_stats[minibatch_idx] = value_loss.detach()
-                approxkl_stats[minibatch_idx] = kl_weighted_mb.detach()
-                vf_clipfrac_stats[minibatch_idx] = torch.zeros((), device=device)
-                minibatch_idx += 1
-                empty_cache()
+            # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
+            kl_terms_mb = (logprobs[b_inds] - new_logprobs) * mask_valid_mb
+            kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
+            kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
+            alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
+            total_loss = (
+                policy_loss
+                + alpha.detach() * kl_weighted_mb
+                + args.vf_coef * value_loss
+            )
+            self.accelerator.backward(total_loss)
+            optimizer.step()
+            optimizer.zero_grad()
+            kl_weighted_accum += kl_weighted_mb.detach()
+            kl_mb_count += 1
+            self.alpha_optimizer.zero_grad()
+            l_alpha_mb = -alpha * (kl_weighted_mb.detach() - args.eps_alpha)
+            l_alpha_mb.backward()
+            self.alpha_optimizer.step()
+            pg_loss_stats[0] = policy_loss.detach()
+            vf_loss_stats[0] = value_loss.detach()
+            approxkl_stats[0] = kl_weighted_mb.detach()
+            vf_clipfrac_stats[0] = torch.zeros((), device=device)
+            empty_cache()
 
             self.state.epoch = (
                 self.state.episode / self.train_dataset_len
@@ -1389,7 +1369,7 @@ class VMPOTrainer(BaseTrainer):
 
     def e_step_dual_update(
         self,
-        padding_mask_p1: torch.Tensor,
+        padding_mask_p1,
         raw_advantages: torch.Tensor,
         args,
         device: torch.device,
