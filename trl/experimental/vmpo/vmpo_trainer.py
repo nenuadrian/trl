@@ -1218,7 +1218,6 @@ class VMPOTrainer(BaseTrainer):
             psi_global, l_eta_full_values = self.e_step_dual_update(
                 padding_mask_p1=padding_mask_p1,
                 raw_advantages=raw_advantages,
-                args=args,
                 device=device,
             )
             # detach ψ before policy/value updates to avoid in-place versioning issues
@@ -1371,7 +1370,6 @@ class VMPOTrainer(BaseTrainer):
         self,
         padding_mask_p1,
         raw_advantages: torch.Tensor,
-        args,
         device: torch.device,
     ) -> tuple[torch.Tensor, list]:
         mask_valid = ~padding_mask_p1
@@ -1380,8 +1378,8 @@ class VMPOTrainer(BaseTrainer):
         num_seqs = adv_seq.numel()
         psi_global = torch.zeros_like(raw_advantages)
         l_eta_full_values = []
-        for _ in range(args.eta_inner_steps):
-            eta = F.softplus(self.model.eta_raw) + args.eta_min
+        for _ in range(self.args.eta_inner_steps):
+            eta = F.softplus(self.model.eta_raw) + self.args.eta_min
             l_eta = torch.zeros((), device=device)
             if num_seqs > 0:
                 max_adv = adv_seq.max()
@@ -1391,7 +1389,7 @@ class VMPOTrainer(BaseTrainer):
                 log_mean_exp = torch.logsumexp(
                     adv_seq / (eta + 1e-8), dim=0
                 ) - math.log(num_seqs)
-                l_eta = eta * (args.eps_eta + log_mean_exp)
+                l_eta = eta * (self.args.eps_eta + log_mean_exp)
             self.eta_optimizer.zero_grad()
             if l_eta.requires_grad:
                 l_eta.backward()
