@@ -36,9 +36,7 @@ from transformers.trainer_callback import (
     ExportableState,
     PrinterCallback,
 )
-import transformers
 from transformers import TrainingArguments
-from packaging.version import Version
 from transformers.utils import ModelOutput, is_peft_available, is_rich_available
 
 from ...models.utils import (
@@ -141,12 +139,6 @@ class VMPOConfig(TrainingArguments):
     eta_min: float = field(
         default=1e-4,
         metadata={"help": "Minimum value added after softplus to keep η positive."},
-    )
-    top_frac: float = field(
-        default=0.1,
-        metadata={
-            "help": "Fraction of valid token advantages to keep for V-MPO weighting (top fraction by advantage)."
-        },
     )
     eps_alpha: float = field(
         default=0.01,
@@ -323,10 +315,6 @@ class VMPOConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to whiten the rewards."},
     )
-    kl_coef: float = field(
-        default=0.05,
-        metadata={"help": "KL coefficient."},
-    )
     kl_estimator: Literal["k1", "k3"] = field(
         default="k1",
         metadata={
@@ -442,10 +430,12 @@ def batch_generation(
     pad_token_id: int,
     generation_config: GenerationConfig,
 ):
+    """Generate responses in micro-batches to control memory, then pad and reshape to the original batch size."""
     query_responses = []
     logitss = []
     batch_size = queries.shape[0]
     for i in range(0, batch_size, local_rollout_forward_batch_size):
+        # Slice a micro-batch to stay within memory limits during generation
         query = queries[i : i + local_rollout_forward_batch_size]
         query_response, logits = generate(
             model,
@@ -456,13 +446,13 @@ def batch_generation(
         query_responses.append(query_response)
         logitss.append(logits)
 
-    # padding tensors
+    # Pad variable-length generations so they can be concatenated back to a full batch tensor
     padded_query_responses = pad(
         query_responses, padding_value=pad_token_id, padding_side="right"
     )
     padded_logitss = pad(logitss, padding_value=0, padding_side="right")
 
-    # reshaping
+    # Reshape the padded tensors to match the original batch ordering and size
     padded_query_responses = padded_query_responses.view(
         -1, padded_query_responses.shape[-1]
     )[:batch_size]
@@ -660,16 +650,18 @@ class VMPOTrainer(BaseTrainer):
     _tag_names = ["trl", "vmpo"]
     _name = "VMPO"
     _paper = {
-        "title": "Fine-Tuning Language Models from Human Preferences",
-        "id": "1909.08593",
-        # docstyle-ignore
+        "title": "V-MPO: On-Policy Maximum a Posteriori Policy Optimization for Discrete and Continuous Control",
+        "id": "song2019vmpoonpolicymaximumposteriori",
         "citation": textwrap.dedent(
             """\
-            @article{mziegler2019fine-tuning,
-                title        = {{Fine-Tuning Language Models from Human Preferences}},
-                author       = {Daniel M. Ziegler and Nisan Stiennon and Jeffrey Wu and Tom B. Brown and Alec Radford and Dario Amodei and Paul F. Christiano and Geoffrey Irving},
-                year         = 2019,
-                eprint       = {arXiv:1909.08593}
+            @misc{song2019vmpoonpolicymaximumposteriori,
+                title={V-MPO: On-Policy Maximum a Posteriori Policy Optimization for Discrete and Continuous Control}, 
+                author={H. Francis Song and Abbas Abdolmaleki and Jost Tobias Springenberg and Aidan Clark and Hubert Soyer and Jack W. Rae and Seb Noury and Arun Ahuja and Siqi Liu and Dhruva Tirumala and Nicolas Heess and Dan Belov and Martin Riedmiller and Matthew M. Botvinick},
+                year={2019},
+                eprint={1909.12238},
+                archivePrefix={arXiv},
+                primaryClass={cs.AI},
+                url={https://arxiv.org/abs/1909.12238}, 
             }"""
         ),
     }
@@ -1197,7 +1189,6 @@ class VMPOTrainer(BaseTrainer):
                 contain_eos_token_post = (postprocessed_responses == eos_id).any(dim=1)
                 if self.args.missing_eos_penalty is not None:
                     scores[~contain_eos_token_post] -= self.args.missing_eos_penalty
-                # accelerator.print(f"{scores=}, {(contain_eos_token_post.sum() / len(contain_eos_token_post))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
                 response_idxs = torch.arange(
@@ -1271,7 +1262,9 @@ class VMPOTrainer(BaseTrainer):
             # Global E-step (compute ψ once per rollout and update η/α)
             mask_valid = ~padding_mask_p1
             valid_len = mask_valid.sum(dim=1).clamp_min(1)
-            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1) / valid_len
+            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(
+                dim=1
+            ) / valid_len
             num_seqs = adv_seq.numel()
             psi_global = torch.zeros_like(raw_advantages)
             l_eta_full_values = []
@@ -1284,7 +1277,9 @@ class VMPOTrainer(BaseTrainer):
                     w_seq = torch.exp((adv_seq - max_adv) / (eta + 1e-8))
                     psi_seq = w_seq / w_seq.sum().clamp_min(1e-8)
                     psi_global = psi_seq[:, None] * mask_valid
-                    log_mean_exp = torch.logsumexp(adv_seq / (eta + 1e-8), dim=0) - math.log(num_seqs)
+                    log_mean_exp = torch.logsumexp(
+                        adv_seq / (eta + 1e-8), dim=0
+                    ) - math.log(num_seqs)
                     l_eta = eta * (args.eps_eta + log_mean_exp)
                 self.eta_optimizer.zero_grad()
                 if l_eta.requires_grad:
