@@ -1169,6 +1169,105 @@ class VMPOTrainer(BaseTrainer):
             rollout_logits,
         )
 
+    def _m_step(
+        self,
+        *,
+        psi_global: torch.Tensor,
+        psi_state: torch.Tensor,
+        queries: torch.Tensor,
+        responses: torch.Tensor,
+        padding_mask_p1: torch.Tensor,
+        logprobs: torch.Tensor,
+        values: torch.Tensor,
+        returns: torch.Tensor,
+        context_length: int,
+        pg_losses: list,
+        vf_losses: list,
+        kl_weighted_accum: torch.Tensor,
+        kl_mb_count: int,
+    ) -> tuple[torch.Tensor, int, list, list, list]:
+        kl_vals_last_mstep: list[torch.Tensor] = []
+        b_inds = np.random.permutation(self.args.local_batch_size)
+        for start in range(0, len(b_inds), self.args.local_mini_batch_size):
+            mb_inds = b_inds[start : start + self.args.local_mini_batch_size]
+            mb_query = queries[mb_inds]
+            mb_response = responses[mb_inds]
+            mb_query_response = torch.cat((mb_query, mb_response), 1)
+            psi_mb = psi_global[mb_inds]
+            psi_state_mb = psi_state[mb_inds]
+            mask_valid_mb = ~padding_mask_p1[mb_inds]
+
+            policy_outputs = forward(
+                self.model.policy,
+                mb_query_response,
+                self.processing_class.pad_token_id,
+            )
+            new_logits = policy_outputs.logits[:, context_length - 1 : -1]
+            new_logprobs = selective_log_softmax(new_logits, mb_response)
+
+            if psi_mb.sum() > 0:
+                policy_loss = -((psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8))
+            else:
+                policy_loss = torch.zeros((), device=self.accelerator.device)
+
+            value_full, _, _ = get_reward(
+                self.accelerator.unwrap_model(self.model).value_model,
+                mb_query_response,
+                self.processing_class.pad_token_id,
+                context_length,
+            )
+            value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
+            value_mask = mask_valid_mb
+            with torch.no_grad():
+                value_old_mb = values[mb_inds]
+                returns_mb = returns[mb_inds]
+                delta = (returns_mb - value_old_mb).clamp(
+                    -self.args.value_clip, self.args.value_clip
+                )
+                value_target = value_old_mb + delta
+            if value_mask.any():
+                value_loss = F.mse_loss(
+                    value_pred[value_mask],
+                    value_target[value_mask],
+                )
+            else:
+                value_loss = torch.zeros((), device=self.accelerator.device)
+
+            kl_terms_mb = (logprobs[mb_inds] - new_logprobs) * mask_valid_mb
+            kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
+            kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
+
+            alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
+            total_loss = (
+                policy_loss
+                + alpha.detach() * kl_weighted_mb
+                + (self.args.vf_coef / self.args.m_steps) * value_loss
+            )
+            self.accelerator.backward(total_loss)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+            kl_weighted_accum += kl_weighted_mb.detach()
+            kl_mb_count += 1
+            pg_losses.append(policy_loss.detach())
+            vf_losses.append(value_loss.detach())
+            kl_vals_last_mstep.append(kl_weighted_mb.detach())
+
+        self.alpha_optimizer.zero_grad()
+        if kl_mb_count > 0:
+            alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
+            kl_mean = kl_weighted_accum / kl_mb_count
+            l_alpha = -alpha * (kl_mean - self.args.eps_alpha)
+            l_alpha.backward()
+            self.alpha_optimizer.step()
+        return (
+            kl_weighted_accum,
+            kl_mb_count,
+            pg_losses,
+            vf_losses,
+            kl_vals_last_mstep,
+        )
+
     def train(self):
         processing_class = self.processing_class
         dataloader = self.dataloader
@@ -1288,89 +1387,29 @@ class VMPOTrainer(BaseTrainer):
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
             pg_losses, vf_losses, kl_vals_last_mstep = [], [], []
-            alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
 
             for _ in range(self.args.m_steps):
-                kl_vals_last_mstep = []  # reset to capture only the last M-step
-                alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
-                b_inds = np.random.permutation(self.args.local_batch_size)
-                for start in range(0, len(b_inds), self.args.local_mini_batch_size):
-                    mb_inds = b_inds[start : start + self.args.local_mini_batch_size]
-
-                    mb_query = queries[mb_inds]
-                    mb_response = responses[mb_inds]
-                    mb_query_response = torch.cat((mb_query, mb_response), 1)
-                    psi_mb = psi_global[mb_inds]
-                    psi_state_mb = psi_state[mb_inds]
-                    mask_valid_mb = ~padding_mask_p1[mb_inds]
-
-                    policy_outputs = forward(
-                        model.policy,
-                        mb_query_response,
-                        processing_class.pad_token_id,
-                    )
-                    new_logits = policy_outputs.logits[:, context_length - 1 : -1]
-                    new_logprobs = selective_log_softmax(new_logits, mb_response)
-
-                    if psi_mb.sum() > 0:
-                        policy_loss = -(
-                            (psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8)
-                        )
-                    else:
-                        policy_loss = torch.zeros((), device=device)
-
-                    value_full, _, _ = get_reward(
-                        self.accelerator.unwrap_model(model).value_model,
-                        mb_query_response,
-                        processing_class.pad_token_id,
-                        context_length,
-                    )
-                    value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
-                    value_mask = mask_valid_mb
-                    with torch.no_grad():
-                        value_old_mb = values[mb_inds]
-                        returns_mb = returns[mb_inds]
-                        delta = (returns_mb - value_old_mb).clamp(
-                            -self.args.value_clip, self.args.value_clip
-                        )
-                        value_target = value_old_mb + delta
-                    if value_mask.any():
-                        value_loss = F.mse_loss(
-                            value_pred[value_mask],
-                            value_target[value_mask],
-                        )
-                    else:
-                        value_loss = torch.zeros((), device=device)
-
-                    kl_terms_mb = (logprobs[mb_inds] - new_logprobs) * mask_valid_mb
-                    kl_state_mb = kl_terms_mb.sum(dim=1) / (
-                        mask_valid_mb.sum(dim=1) + 1e-8
-                    )
-                    kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
-
-                    total_loss = (
-                        policy_loss
-                        + alpha.detach() * kl_weighted_mb
-                        + (self.args.vf_coef / self.args.m_steps) * value_loss
-                    )
-                    self.accelerator.backward(total_loss)
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                    kl_weighted_accum += kl_weighted_mb.detach()
-                    kl_mb_count += 1
-                    pg_losses.append(policy_loss.detach())
-                    vf_losses.append(value_loss.detach())
-                    kl_vals_last_mstep.append(kl_weighted_mb.detach())
-
-                self.alpha_optimizer.zero_grad()
-                if kl_mb_count > 0:
-                    alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
-                    kl_mean = kl_weighted_accum / kl_mb_count
-                    l_alpha = -alpha * (kl_mean - self.args.eps_alpha)
-                    l_alpha.backward()
-                    self.alpha_optimizer.step()
-
+                (
+                    kl_weighted_accum,
+                    kl_mb_count,
+                    pg_losses,
+                    vf_losses,
+                    kl_vals_last_mstep,
+                ) = self._m_step(
+                    psi_global=psi_global,
+                    psi_state=psi_state,
+                    queries=queries,
+                    responses=responses,
+                    padding_mask_p1=padding_mask_p1,
+                    logprobs=logprobs,
+                    values=values,
+                    returns=returns,
+                    context_length=context_length,
+                    pg_losses=pg_losses,
+                    vf_losses=vf_losses,
+                    kl_weighted_accum=kl_weighted_accum,
+                    kl_mb_count=kl_mb_count,
+                )
             if len(pg_losses) > 0:
                 pg_loss_stats[0] = torch.stack(pg_losses).mean()
             if len(vf_losses) > 0:
