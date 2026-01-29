@@ -956,6 +956,7 @@ class VMPOTrainer(BaseTrainer):
         reward_model,
         processing_class,
         generation_config,
+        eos_id,
         device,
     ):
         data = next(iter_dataloader)
@@ -1263,6 +1264,7 @@ class VMPOTrainer(BaseTrainer):
                 reward_model,
                 processing_class,
                 generation_config,
+                eos_id,
                 device,
             )
 
