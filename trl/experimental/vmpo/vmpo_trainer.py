@@ -698,6 +698,7 @@ class VMPOTrainer(BaseTrainer):
         self.args = args
         self.processing_class = processing_class
         self.policy_model = model
+        self.is_deepspeed_enabled = False
 
         # Define the collator if not provided
         if data_collator is None:
@@ -945,8 +946,221 @@ class VMPOTrainer(BaseTrainer):
 
         self.model = backup_model
 
+    def collect_rollouts(
+        self,
+        generation_kwargs: dict,
+        accelerator: Accelerator,
+        iter_dataloader,
+        model,
+        ref_policy,
+        reward_model,
+        processing_class,
+        generation_config,
+        device,
+    ):
+        data = next(iter_dataloader)
+        with torch.no_grad():
+            queries = data["input_ids"].to(device)
+            context_length = queries.shape[1]
+            responses = []
+            postprocessed_responses = []
+            contain_eos_token_raw = []
+            logprobs = []
+            ref_logprobs = []
+            scores = []
+            sequence_lengths = []
+            values = []
+            rollout_logits = []
+            with unwrap_model_for_generation(
+                self.model,
+                self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                generation_kwargs=generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
+            ) as unwrapped_model:
+                query_responses, logitss = batch_generation(
+                    unwrapped_model.policy,
+                    queries,
+                    self.args.local_rollout_forward_batch_size,
+                    processing_class.pad_token_id,
+                    generation_config,
+                )
+
+            for i in range(
+                0, queries.shape[0], self.args.local_rollout_forward_batch_size
+            ):
+                query = queries[i : i + self.args.local_rollout_forward_batch_size]
+                query_response = query_responses[
+                    i : i + self.args.local_rollout_forward_batch_size
+                ]
+                response = query_response[:, context_length:]
+                contain_eos_token_raw.append((response == eos_id).any(dim=1))
+                logits = logitss[i : i + self.args.local_rollout_forward_batch_size]
+                logprob = selective_log_softmax(logits, response)
+                rollout_logits.append(logits)
+                del logits
+                empty_cache()
+
+                if ref_policy is None:
+                    with self.null_ref_context():
+                        ref_output = forward(
+                            model.policy,
+                            query_response,
+                            processing_class.pad_token_id,
+                        )
+                else:
+                    ref_output = forward(
+                        ref_policy, query_response, processing_class.pad_token_id
+                    )
+                ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                ref_logprob = selective_log_softmax(ref_logits, response)
+                del ref_output, ref_logits
+                empty_cache()
+
+                # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
+                postprocessed_response = response
+                if (
+                    self.stop_token_id is not None
+                ):  # handle the edge case when stop_token_id exists but is 0
+                    postprocessed_response = truncate_response(
+                        self.stop_token_id, processing_class.pad_token_id, response
+                    )
+
+                # Response Processing 2. run reward model on the truncated responses
+                postprocessed_query_response = torch.cat(
+                    (query, postprocessed_response), 1
+                )
+                pad_mask = postprocessed_response == processing_class.pad_token_id
+                has_pad = pad_mask.any(dim=1)
+                pad_idx = first_true_indices(pad_mask)
+
+                sequence_length = torch.where(
+                    has_pad,
+                    pad_idx - 1,
+                    torch.full_like(pad_idx, postprocessed_response.shape[1] - 1),
+                )
+                unwrapped_value_model = accelerator.unwrap_model(model).value_model
+                full_value, _, _ = get_reward(
+                    unwrapped_value_model,
+                    query_response,
+                    processing_class.pad_token_id,
+                    context_length,
+                )
+                value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                _, score, _ = get_reward(
+                    reward_model,
+                    postprocessed_query_response,
+                    processing_class.pad_token_id,
+                    context_length,
+                )
+
+                responses.append(response)
+                postprocessed_responses.append(postprocessed_response)
+                logprobs.append(logprob)
+                ref_logprobs.append(ref_logprob)
+                sequence_lengths.append(sequence_length)
+                scores.append(score)
+                values.append(value)
+            responses = torch.cat(responses, 0)
+            postprocessed_responses = torch.cat(postprocessed_responses, 0)
+            contain_eos_token_raw = torch.cat(contain_eos_token_raw, 0)
+            logprobs = torch.cat(logprobs, 0)
+            ref_logprobs = torch.cat(ref_logprobs, 0)
+            sequence_lengths = torch.cat(sequence_lengths, 0)
+            scores = torch.cat(scores, 0)
+            values = torch.cat(values, 0)
+            rollout_logits = torch.cat(rollout_logits, 0)
+            del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
+            empty_cache()
+            gc.collect()
+
+            # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
+            # Completions not passing that filter will receive a lower score.
+            contain_eos_token_post = (postprocessed_responses == eos_id).any(dim=1)
+            if self.args.missing_eos_penalty is not None:
+                scores[~contain_eos_token_post] -= self.args.missing_eos_penalty
+
+            # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
+            response_idxs = torch.arange(
+                responses.shape[1], device=responses.device
+            ).repeat(responses.shape[0], 1)
+            padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
+            logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
+            ref_logprobs = torch.masked_fill(
+                ref_logprobs, padding_mask, INVALID_LOGPROB
+            )
+            # rollout logits alignment check
+            old_lp = selective_log_softmax(rollout_logits, responses)
+            diff = (old_lp - logprobs).abs()
+            diff = diff.masked_fill(padding_mask, 0)
+            mean_diff = diff.sum() / ((~padding_mask).sum() + 1e-8)
+            assert mean_diff < 1e-4, "rollout_logits misaligned with stored logprobs"
+            sequence_lengths_p1 = sequence_lengths + 1
+            padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
+            values = torch.masked_fill(values, padding_mask_p1, 0)
+
+            # 4. compute rewards
+            # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
+            logr = ref_logprobs - logprobs
+            kl = -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr
+            # trust region KL is handled by α; no PPO-style shaping
+            rewards = torch.zeros_like(kl)
+            actual_start = torch.arange(rewards.size(0), device=rewards.device)
+            actual_end = torch.where(
+                sequence_lengths_p1 < rewards.size(1),
+                sequence_lengths_p1,
+                sequence_lengths,
+            )
+            rewards[actual_start, actual_end] += scores
+            if self.args.eos_bonus > 0:
+                eos_positions = first_true_indices(postprocessed_responses == eos_id)
+                has_eos = contain_eos_token_post
+                batch_idx = torch.arange(rewards.size(0), device=rewards.device)[
+                    has_eos
+                ]
+                rewards[batch_idx, eos_positions[has_eos]] += args.eos_bonus
+            # logging masks/summaries
+            reward_valid_mask = ~padding_mask_p1
+            reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
+            reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
+
+            # 5. whiten rewards
+            if self.args.whiten_rewards:
+                rewards = masked_whiten(
+                    rewards, mask=~padding_mask_p1, shift_mean=False
+                )
+                rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
+
+            # 6. compute advantages and returns
+            lastgaelam = 0
+            advantages_reversed = []
+            gen_length = responses.shape[1]
+            for t in reversed(range(gen_length)):
+                nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+                delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
+                not_done = ~padding_mask_p1[:, t]
+                lastgaelam = delta + args.gamma * args.lam * lastgaelam * not_done
+                advantages_reversed.append(lastgaelam)
+            raw_advantages = torch.stack(advantages_reversed[::-1], axis=1)
+            returns = raw_advantages + values
+            empty_cache()
+        return (
+            padding_mask_p1,
+            raw_advantages,
+            queries,
+            responses,
+            context_length,
+            logprobs,
+            scores,
+            values,
+            returns,
+            reward_seq,
+            reward_tok,
+            contain_eos_token_raw,
+            contain_eos_token_post,
+            rollout_logits,
+        )
+
     def train(self):
-        args = self.args
         processing_class = self.processing_class
         dataloader = self.dataloader
         accelerator = self.accelerator
@@ -962,8 +1176,8 @@ class VMPOTrainer(BaseTrainer):
 
         iter_dataloader = iter(repeat_generator())
         generation_kwargs = {
-            "max_new_tokens": args.response_length,
-            "temperature": (args.temperature + 1e-7),
+            "max_new_tokens": self.args.response_length,
+            "temperature": (self.args.temperature + 1e-7),
             "top_k": 0.0,
             "top_p": 1.0,
             "do_sample": True,
@@ -978,8 +1192,8 @@ class VMPOTrainer(BaseTrainer):
 
         accelerator.print("===training policy===")
         stats_shape = (
-            args.num_mini_batches,
-            args.gradient_accumulation_steps,
+            self.args.num_mini_batches,
+            self.args.gradient_accumulation_steps,
         )
         approxkl_stats = torch.zeros(stats_shape, device=device)
         pg_loss_stats = torch.zeros(stats_shape, device=device)
@@ -990,229 +1204,67 @@ class VMPOTrainer(BaseTrainer):
         # trainer state initialization
         self.state.global_step = 0
         self.state.episode = 0
-        self.state.max_steps = args.num_total_batches
-        self.state.num_train_epochs = args.total_episodes / self.train_dataset_len
+        self.state.max_steps = self.args.num_total_batches
+        self.state.num_train_epochs = self.args.total_episodes / self.train_dataset_len
         # Compute absolute values for logging, eval, and save if given as ratio
-        if args.logging_steps is not None:
-            if args.logging_steps < 1:
+        if self.args.logging_steps is not None:
+            if self.args.logging_steps < 1:
                 self.state.logging_steps = math.ceil(
-                    self.state.max_steps * args.logging_steps
+                    self.state.max_steps * self.args.logging_steps
                 )
             else:
-                self.state.logging_steps = args.logging_steps
-        if args.eval_steps is not None:
-            if args.eval_steps < 1:
+                self.state.logging_steps = self.args.logging_steps
+        if self.args.eval_steps is not None:
+            if self.args.eval_steps < 1:
                 self.state.eval_steps = math.ceil(
-                    self.state.max_steps * args.eval_steps
+                    self.state.max_steps * self.args.eval_steps
                 )
             else:
-                self.state.eval_steps = args.eval_steps
-        if args.save_steps is not None:
-            if args.save_steps < 1:
+                self.state.eval_steps = self.args.eval_steps
+        if self.args.save_steps is not None:
+            if self.args.save_steps < 1:
                 self.state.save_steps = math.ceil(
-                    self.state.max_steps * args.save_steps
+                    self.state.max_steps * self.args.save_steps
                 )
             else:
-                self.state.save_steps = args.save_steps
+                self.state.save_steps = self.args.save_steps
         self.control = self.callback_handler.on_train_begin(
-            args, self.state, self.control
+            self.args, self.state, self.control
         )
 
-        for update in range(1, args.num_total_batches + 1):
+        for update in range(1, self.args.num_total_batches + 1):
             approxkl_stats.zero_()
             pg_loss_stats.zero_()
             vf_loss_stats.zero_()
             vf_clipfrac_stats.zero_()
-            self.state.episode += 1 * args.batch_size
-            data = next(iter_dataloader)
-            with torch.no_grad():
-                queries = data["input_ids"].to(device)
-                context_length = queries.shape[1]
-                responses = []
-                postprocessed_responses = []
-                contain_eos_token_raw = []
-                logprobs = []
-                ref_logprobs = []
-                scores = []
-                sequence_lengths = []
-                values = []
-                rollout_logits = []
-                with unwrap_model_for_generation(
-                    self.model,
-                    self.accelerator,
-                    gather_deepspeed3_params=self.args.ds3_gather_for_generation,
-                    generation_kwargs=generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
-                ) as unwrapped_model:
-                    query_responses, logitss = batch_generation(
-                        unwrapped_model.policy,
-                        queries,
-                        args.local_rollout_forward_batch_size,
-                        processing_class.pad_token_id,
-                        generation_config,
-                    )
+            self.state.episode += 1 * self.args.batch_size
 
-                for i in range(
-                    0, queries.shape[0], args.local_rollout_forward_batch_size
-                ):
-                    query = queries[i : i + args.local_rollout_forward_batch_size]
-                    query_response = query_responses[
-                        i : i + args.local_rollout_forward_batch_size
-                    ]
-                    response = query_response[:, context_length:]
-                    contain_eos_token_raw.append((response == eos_id).any(dim=1))
-                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
-                    logprob = selective_log_softmax(logits, response)
-                    rollout_logits.append(logits)
-                    del logits
-                    empty_cache()
-
-                    if ref_policy is None:
-                        with self.null_ref_context():
-                            ref_output = forward(
-                                model.policy,
-                                query_response,
-                                processing_class.pad_token_id,
-                            )
-                    else:
-                        ref_output = forward(
-                            ref_policy, query_response, processing_class.pad_token_id
-                        )
-                    ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                    ref_logprob = selective_log_softmax(ref_logits, response)
-                    del ref_output, ref_logits
-                    empty_cache()
-
-                    # Response Processing 1. truncate response after the first occurrence of `stop_token_id`
-                    postprocessed_response = response
-                    if (
-                        self.stop_token_id is not None
-                    ):  # handle the edge case when stop_token_id exists but is 0
-                        postprocessed_response = truncate_response(
-                            self.stop_token_id, processing_class.pad_token_id, response
-                        )
-
-                    # Response Processing 2. run reward model on the truncated responses
-                    postprocessed_query_response = torch.cat(
-                        (query, postprocessed_response), 1
-                    )
-                    pad_mask = postprocessed_response == processing_class.pad_token_id
-                    has_pad = pad_mask.any(dim=1)
-                    pad_idx = first_true_indices(pad_mask)
-
-                    sequence_length = torch.where(
-                        has_pad,
-                        pad_idx - 1,
-                        torch.full_like(pad_idx, postprocessed_response.shape[1] - 1),
-                    )
-                    unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                    full_value, _, _ = get_reward(
-                        unwrapped_value_model,
-                        query_response,
-                        processing_class.pad_token_id,
-                        context_length,
-                    )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
-                    _, score, _ = get_reward(
-                        reward_model,
-                        postprocessed_query_response,
-                        processing_class.pad_token_id,
-                        context_length,
-                    )
-
-                    responses.append(response)
-                    postprocessed_responses.append(postprocessed_response)
-                    logprobs.append(logprob)
-                    ref_logprobs.append(ref_logprob)
-                    sequence_lengths.append(sequence_length)
-                    scores.append(score)
-                    values.append(value)
-                responses = torch.cat(responses, 0)
-                postprocessed_responses = torch.cat(postprocessed_responses, 0)
-                contain_eos_token_raw = torch.cat(contain_eos_token_raw, 0)
-                logprobs = torch.cat(logprobs, 0)
-                ref_logprobs = torch.cat(ref_logprobs, 0)
-                sequence_lengths = torch.cat(sequence_lengths, 0)
-                scores = torch.cat(scores, 0)
-                values = torch.cat(values, 0)
-                rollout_logits = torch.cat(rollout_logits, 0)
-                del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
-                empty_cache()
-                gc.collect()
-
-                # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
-                # Completions not passing that filter will receive a lower score.
-                contain_eos_token_post = (postprocessed_responses == eos_id).any(dim=1)
-                if self.args.missing_eos_penalty is not None:
-                    scores[~contain_eos_token_post] -= self.args.missing_eos_penalty
-
-                # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(
-                    responses.shape[1], device=responses.device
-                ).repeat(responses.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
-                logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-                ref_logprobs = torch.masked_fill(
-                    ref_logprobs, padding_mask, INVALID_LOGPROB
-                )
-                # rollout logits alignment check
-                old_lp = selective_log_softmax(rollout_logits, responses)
-                diff = (old_lp - logprobs).abs()
-                diff = diff.masked_fill(padding_mask, 0)
-                mean_diff = diff.sum() / ((~padding_mask).sum() + 1e-8)
-                assert (
-                    mean_diff < 1e-4
-                ), "rollout_logits misaligned with stored logprobs"
-                sequence_lengths_p1 = sequence_lengths + 1
-                padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
-                values = torch.masked_fill(values, padding_mask_p1, 0)
-
-                # 4. compute rewards
-                # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
-                logr = ref_logprobs - logprobs
-                kl = -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr
-                # trust region KL is handled by α; no PPO-style shaping
-                rewards = torch.zeros_like(kl)
-                actual_start = torch.arange(rewards.size(0), device=rewards.device)
-                actual_end = torch.where(
-                    sequence_lengths_p1 < rewards.size(1),
-                    sequence_lengths_p1,
-                    sequence_lengths,
-                )
-                rewards[actual_start, actual_end] += scores
-                if args.eos_bonus > 0:
-                    eos_positions = first_true_indices(
-                        postprocessed_responses == eos_id
-                    )
-                    has_eos = contain_eos_token_post
-                    batch_idx = torch.arange(rewards.size(0), device=rewards.device)[
-                        has_eos
-                    ]
-                    rewards[batch_idx, eos_positions[has_eos]] += args.eos_bonus
-                # logging masks/summaries
-                reward_valid_mask = ~padding_mask_p1
-                reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
-                reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
-
-                # 5. whiten rewards
-                if args.whiten_rewards:
-                    rewards = masked_whiten(
-                        rewards, mask=~padding_mask_p1, shift_mean=False
-                    )
-                    rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
-
-                # 6. compute advantages and returns
-                lastgaelam = 0
-                advantages_reversed = []
-                gen_length = responses.shape[1]
-                for t in reversed(range(gen_length)):
-                    nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-                    delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
-                    not_done = ~padding_mask_p1[:, t]
-                    lastgaelam = delta + args.gamma * args.lam * lastgaelam * not_done
-                    advantages_reversed.append(lastgaelam)
-                raw_advantages = torch.stack(advantages_reversed[::-1], axis=1)
-                returns = raw_advantages + values
-                empty_cache()
+            (
+                padding_mask_p1,
+                raw_advantages,
+                queries,
+                responses,
+                context_length,
+                logprobs,
+                scores,
+                values,
+                returns,
+                reward_seq,
+                reward_tok,
+                contain_eos_token_raw,
+                contain_eos_token_post,
+                rollout_logits,
+            ) = self.collect_rollouts(
+                generation_kwargs,
+                accelerator,
+                iter_dataloader,
+                model,
+                ref_policy,
+                reward_model,
+                processing_class,
+                generation_config,
+                device,
+            )
 
             # Global E-step (compute ψ once per rollout and update η/α)
             psi_global, l_eta_full_values = self.e_step_dual_update(
@@ -1227,7 +1279,7 @@ class VMPOTrainer(BaseTrainer):
             # Do V-MPO training in a single pass
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
-            b_inds = np.random.permutation(args.local_batch_size)
+            b_inds = np.random.permutation(self.args.local_batch_size)
 
             mb_query = queries[b_inds]
             mb_response = responses[b_inds]
@@ -1261,7 +1313,7 @@ class VMPOTrainer(BaseTrainer):
                 value_old_mb = values[b_inds]
                 returns_mb = returns[b_inds]
                 delta = (returns_mb - value_old_mb).clamp(
-                    -args.value_clip, args.value_clip
+                    -self.args.value_clip, self.args.value_clip
                 )
                 value_target = value_old_mb + delta
             if value_mask.any():
@@ -1276,11 +1328,11 @@ class VMPOTrainer(BaseTrainer):
             kl_terms_mb = (logprobs[b_inds] - new_logprobs) * mask_valid_mb
             kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
             kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
-            alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
+            alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
             total_loss = (
                 policy_loss
                 + alpha.detach() * kl_weighted_mb
-                + args.vf_coef * value_loss
+                + self.args.vf_coef * value_loss
             )
             self.accelerator.backward(total_loss)
             optimizer.step()
@@ -1288,7 +1340,7 @@ class VMPOTrainer(BaseTrainer):
             kl_weighted_accum += kl_weighted_mb.detach()
             kl_mb_count += 1
             self.alpha_optimizer.zero_grad()
-            l_alpha_mb = -alpha * (kl_weighted_mb.detach() - args.eps_alpha)
+            l_alpha_mb = -alpha * (kl_weighted_mb.detach() - self.args.eps_alpha)
             l_alpha_mb.backward()
             self.alpha_optimizer.step()
             pg_loss_stats[0] = policy_loss.detach()
@@ -1322,34 +1374,27 @@ class VMPOTrainer(BaseTrainer):
 
             self.lr_scheduler.step()
             self.control = self.callback_handler.on_step_end(
-                args, self.state, self.control
+                self.args, self.state, self.control
             )
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None)
                 self.control = self.callback_handler.on_save(
                     self.args, self.state, self.control
                 )
-            del (
-                kl,
-                scores,
-            )
+            del (scores,)
             empty_cache()
             gc.collect()
 
             if (
-                args.num_sample_generations > 0
+                self.args.num_sample_generations > 0
                 and (update - 1) % self.sample_generations_freq == 0
             ):
                 self.generate_completions(sampling=True)
                 empty_cache()
             del (
-                query_responses,
                 responses,
-                postprocessed_responses,
                 logprobs,
-                ref_logprobs,
                 values,
-                sequence_lengths,
                 contain_eos_token_post,
                 contain_eos_token_raw,
                 rollout_logits,
@@ -1358,7 +1403,7 @@ class VMPOTrainer(BaseTrainer):
 
         # HF trainer specifics
         self.control = self.callback_handler.on_train_end(
-            args, self.state, self.control
+            self.args, self.state, self.control
         )
         if self.control.should_save:
             self._save_checkpoint(model, trial=None)
