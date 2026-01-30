@@ -1502,13 +1502,18 @@ class VMPOTrainer(BaseTrainer):
                 policy_loss = torch.zeros((), device=self.accelerator.device)
 
             # ---- Value forward ----
-            value_full, _, _ = get_reward(
-                self.accelerator.unwrap_model(self.model).value_model,
-                mb_query_response,
-                self.processing_class.pad_token_id,
-                context_length,
+            with torch.no_grad():
+                value_features = forward(
+                    self.accelerator.unwrap_model(self.model).value_model.base_model,
+                    mb_query_response,
+                    self.processing_class.pad_token_id,
+                ).hidden_states[-1]
+
+            value_pred = (
+                self.accelerator.unwrap_model(self.model)
+                .value_model.score(value_features)
+                .squeeze(-1)[:, context_length - 1 : -1]
             )
-            value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
             value_mask = mask_valid_mb
 
             # ---- Value targets ----
@@ -1539,6 +1544,10 @@ class VMPOTrainer(BaseTrainer):
             self.accelerator.backward(total_loss)
             self.optimizer.step()
             self.optimizer.zero_grad()
+            
+            # ---- FORCE GRAPH DESTRUCTION (value path) ----
+            del value_pred
+            torch.cuda.empty_cache()
 
             # ---- Statistics ----
             kl_weighted_accum += kl_weighted_mb.detach()
