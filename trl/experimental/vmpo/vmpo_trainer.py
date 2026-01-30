@@ -289,6 +289,14 @@ class VMPOConfig(TrainingArguments):
             "exceed the VRAM capacity of a single GPU, albeit at the cost of slower generation."
         },
     )
+    eta_reset_interval: int | None = field(
+        default=None,
+        metadata={"help": "Reset eta_raw every N updates. Set to None to disable."},
+    )
+    eta_reset_value: float = field(
+        default=0.2,
+        metadata={"help": "Value to reset eta to (before softplus)."},
+    )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
@@ -318,6 +326,17 @@ INVALID_LOGPROB = 0.0
 def inv_softplus(x: torch.Tensor) -> torch.Tensor:
     # assumes x > 0; stable inverse of softplus
     return x + torch.log1p(-torch.exp(-x))
+
+
+def set_eta(model, eta_value: float):
+    """
+    Reset eta_raw so that softplus(eta_raw) ≈ eta_value.
+    """
+    with torch.no_grad():
+        eta_raw_value = inv_softplus(
+            torch.tensor(eta_value, device=model.eta_raw.device)
+        )
+        model.eta_raw.copy_(eta_raw_value)
 
 
 def generate(
@@ -1277,6 +1296,22 @@ class VMPOTrainer(BaseTrainer):
             )
 
             self.lr_scheduler.step()
+
+            # ---- ETA RESET ----
+            if (
+                self.args.eta_reset_interval is not None
+                and update % self.args.eta_reset_interval == 0
+                and self.accelerator.is_main_process
+            ):
+                set_eta(self.model, self.args.eta_reset_value)
+                self.accelerator.print(
+                    f"[VMPO] Reset eta to {self.args.eta_reset_value} at update {update}"
+                )
+            self.accelerator.wait_for_everyone()
+            self.model.eta_raw.data = self.accelerator.broadcast(
+                self.model.eta_raw.data, src=0
+            )
+
             self.control = self.callback_handler.on_step_end(
                 self.args, self.state, self.control
             )
