@@ -67,62 +67,6 @@ class VMPOConfig(TrainingArguments):
     Using [`~transformers.HfArgumentParser`] we can turn this class into
     [argparse](https://docs.python.org/3/library/argparse#module-argparse) arguments that can be specified on the
     command line.
-
-    Parameters:
-        run_name (`str`, *optional*):
-            Name of the run.
-        dataset_num_proc (`int`, *optional*):
-            Number of processes to use for processing the dataset.
-        num_mini_batches (`int`, *optional*, defaults to `1`):
-            Number of minibatches to split a batch into.
-        total_episodes (`int`, *optional*):
-            Total number of episodes in the dataset.
-        local_rollout_forward_batch_size (`int`, *optional*, defaults to `64`):
-            Per rank no grad forward pass in the rollout phase.
-        num_sample_generations (`int`, *optional*, defaults to `10`):
-            Number of debugging samples generations (i.e., `generate_completions` calls) throughout training.
-        response_length (`int`, *optional*, defaults to `53`):
-            Length of the response.
-        stop_token (`str`, *optional*):
-            Specifies the stop token to use for text generation. This parameter is mutually exclusive with
-            `stop_token_id`.
-
-            - `None`: No stop token is applied, unless `stop_token_id` is specified.
-            - `'eos'`: Uses the tokenizer's `eos_token`.
-
-        stop_token_id (`int`, *optional*):
-            Specifies the ID of the stop token to use for text generation. If `None`, no stop token ID is applied,
-            unless `stop_token` is specified. This parameter is mutually exclusive with `stop_token`.
-        temperature (`float`, *optional*, defaults to `0.7`):
-            Sampling temperature.
-        missing_eos_penalty (`float`, *optional*):
-            Penalty applied to the score when the model fails to generate an EOS token. This is useful to encourage to
-            generate completions shorter than the maximum length (`max_new_tokens`). The penalty must be a positive
-            value.
-        sft_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
-            Path to the SFT model.
-        world_size (`int`, *optional*):
-            Number of processes (GPUs) to use for the training.
-        num_total_batches (`int`, *optional*):
-            Number of total batches to train.
-        micro_batch_size (`int`, *optional*):
-            Micro batch size across devices (HF's `per_device_train_batch_size` * `world_size`).
-        local_batch_size (`int`, *optional*):
-            Batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`).
-        batch_size (`int`, *optional*):
-            Batch size across devices (HF's `per_device_train_batch_size` * `world_size` *
-            `gradient_accumulation_steps`).
-        local_mini_batch_size (`int`, *optional*):
-            Mini batch size per GPU.
-        push_to_hub (`bool`, *optional*, defaults to `False`):
-            Whether to push the model to the Hub after training.
-        exp_name (`str`, *optional*, defaults to `os.path.basename(__file__)[:-3]`):
-            Name of this experiment.
-        reward_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
-            Path to the reward model.
-        value_clip (`float`, *optional*, defaults to `0.2`):
-            Clip range for value targets (±value_clip).
-
     """
 
     eps_eta: float = field(
@@ -296,6 +240,10 @@ class VMPOConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to push the model to the Hub after training."},
     )
+    use_ppo_clip_value_targets: bool = field(
+        default=False,
+        metadata={"help": "Whether to use PPO clip value targets."},
+    )  
     exp_name: str = field(
         default=os.path.basename(__file__)[:-3],
         metadata={"help": "Name of this experiment."},
@@ -315,10 +263,6 @@ class VMPOConfig(TrainingArguments):
         metadata={
             "help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."
         },
-    )
-    whiten_rewards: bool = field(
-        default=False,
-        metadata={"help": "Whether to whiten the rewards."},
     )
     kl_estimator: Literal["k1", "k3"] = field(
         default="k1",
@@ -784,10 +728,6 @@ class VMPOTrainer(BaseTrainer):
             args.num_mini_batches,
             "`local_batch_size` must be a multiple of `num_mini_batches`",
         )
-        if args.whiten_rewards:
-            assert (
-                args.local_mini_batch_size >= 8
-            ), f"Per-rank minibatch size {args.local_mini_batch_size} is insufficient for whitening"
         # `per_rank_rollout_batch_size` is our `args.local_batch_size`
         # `per_rank_minibatch_size` is our `args.local_mini_batch_size`
         args.num_total_batches = math.ceil(
@@ -1130,27 +1070,11 @@ class VMPOTrainer(BaseTrainer):
             reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
             reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
 
-            # 5. whiten rewards
-            if self.args.whiten_rewards:
-                rewards = masked_whiten(
-                    rewards, mask=~padding_mask_p1, shift_mean=False
-                )
-                rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
-
-            # 6. compute advantages and returns
-            lastgaelam = 0
-            advantages_reversed = []
-            gen_length = responses.shape[1]
-            for t in reversed(range(gen_length)):
-                nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-                delta = rewards[:, t] + self.args.gamma * nextvalues - values[:, t]
-                not_done = ~padding_mask_p1[:, t]
-                lastgaelam = (
-                    delta + self.args.gamma * self.args.lam * lastgaelam * not_done
-                )
-                advantages_reversed.append(lastgaelam)
-            raw_advantages = torch.stack(advantages_reversed[::-1], axis=1)
-            returns = raw_advantages + values
+            raw_advantages, returns = self._compute_gae(
+                rewards=rewards,
+                values=values,
+                padding_mask_p1=padding_mask_p1,
+            )
             empty_cache()
         return (
             padding_mask_p1,
@@ -1169,104 +1093,27 @@ class VMPOTrainer(BaseTrainer):
             rollout_logits,
         )
 
-    def _m_step(
+    def _compute_gae(
         self,
-        *,
-        psi_global: torch.Tensor,
-        psi_state: torch.Tensor,
-        queries: torch.Tensor,
-        responses: torch.Tensor,
-        padding_mask_p1: torch.Tensor,
-        logprobs: torch.Tensor,
+        rewards: torch.Tensor,
         values: torch.Tensor,
-        returns: torch.Tensor,
-        context_length: int,
-        pg_losses: list,
-        vf_losses: list,
-        kl_weighted_accum: torch.Tensor,
-        kl_mb_count: int,
-    ) -> tuple[torch.Tensor, int, list, list, list]:
-        kl_vals_last_mstep: list[torch.Tensor] = []
-        b_inds = np.random.permutation(self.args.local_batch_size)
-        for start in range(0, len(b_inds), self.args.local_mini_batch_size):
-            mb_inds = b_inds[start : start + self.args.local_mini_batch_size]
-            mb_query = queries[mb_inds]
-            mb_response = responses[mb_inds]
-            mb_query_response = torch.cat((mb_query, mb_response), 1)
-            psi_mb = psi_global[mb_inds]
-            psi_state_mb = psi_state[mb_inds]
-            mask_valid_mb = ~padding_mask_p1[mb_inds]
-
-            policy_outputs = forward(
-                self.model.policy,
-                mb_query_response,
-                self.processing_class.pad_token_id,
+        padding_mask_p1: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute generalized advantage estimation (GAE) and returns."""
+        lastgaelam = 0
+        advantages_reversed = []
+        gen_length = rewards.shape[1]
+        for t in reversed(range(gen_length)):
+            nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+            delta = rewards[:, t] + self.args.gamma * nextvalues - values[:, t]
+            not_done = ~padding_mask_p1[:, t]
+            lastgaelam = (
+                delta + self.args.gamma * self.args.lam * lastgaelam * not_done
             )
-            new_logits = policy_outputs.logits[:, context_length - 1 : -1]
-            new_logprobs = selective_log_softmax(new_logits, mb_response)
-
-            if psi_mb.sum() > 0:
-                policy_loss = -((psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8))
-            else:
-                policy_loss = torch.zeros((), device=self.accelerator.device)
-
-            value_full, _, _ = get_reward(
-                self.accelerator.unwrap_model(self.model).value_model,
-                mb_query_response,
-                self.processing_class.pad_token_id,
-                context_length,
-            )
-            value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
-            value_mask = mask_valid_mb
-            with torch.no_grad():
-                value_old_mb = values[mb_inds]
-                returns_mb = returns[mb_inds]
-                delta = (returns_mb - value_old_mb).clamp(
-                    -self.args.value_clip, self.args.value_clip
-                )
-                value_target = value_old_mb + delta
-            if value_mask.any():
-                value_loss = F.mse_loss(
-                    value_pred[value_mask],
-                    value_target[value_mask],
-                )
-            else:
-                value_loss = torch.zeros((), device=self.accelerator.device)
-
-            kl_terms_mb = (logprobs[mb_inds] - new_logprobs) * mask_valid_mb
-            kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
-            kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
-
-            alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
-            total_loss = (
-                policy_loss
-                + alpha.detach() * kl_weighted_mb
-                + (self.args.vf_coef / self.args.m_steps) * value_loss
-            )
-            self.accelerator.backward(total_loss)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-            kl_weighted_accum += kl_weighted_mb.detach()
-            kl_mb_count += 1
-            pg_losses.append(policy_loss.detach())
-            vf_losses.append(value_loss.detach())
-            kl_vals_last_mstep.append(kl_weighted_mb.detach())
-
-        self.alpha_optimizer.zero_grad()
-        if kl_mb_count > 0:
-            alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
-            kl_mean = kl_weighted_accum / kl_mb_count
-            l_alpha = -alpha * (kl_mean - self.args.eps_alpha)
-            l_alpha.backward()
-            self.alpha_optimizer.step()
-        return (
-            kl_weighted_accum,
-            kl_mb_count,
-            pg_losses,
-            vf_losses,
-            kl_vals_last_mstep,
-        )
+            advantages_reversed.append(lastgaelam)
+        raw_advantages = torch.stack(advantages_reversed[::-1], dim=1)
+        returns = raw_advantages + values
+        return raw_advantages, returns
 
     def train(self):
         processing_class = self.processing_class
@@ -1375,7 +1222,7 @@ class VMPOTrainer(BaseTrainer):
                 device,
             )
 
-            psi_global, l_eta_full_values = self.e_step_dual_update(
+            psi_global, l_eta_full_values = self._e_step_dual_update(
                 padding_mask_p1=padding_mask_p1,
                 raw_advantages=raw_advantages,
                 device=device,
@@ -1483,38 +1330,235 @@ class VMPOTrainer(BaseTrainer):
                 self.args, self.state, self.control
             )
 
-    def e_step_dual_update(
+    def _e_step_dual_update(
         self,
         padding_mask_p1,
         raw_advantages: torch.Tensor,
         device: torch.device,
     ) -> tuple[torch.Tensor, list]:
+        # mask_valid[t] = True for valid (non-padding) tokens
+        # Shape: [batch, T]
         mask_valid = ~padding_mask_p1
+
+        # Number of valid tokens per sequence
+        # Clamp to 1 to avoid division by zero for degenerate sequences
         valid_len = mask_valid.sum(dim=1).clamp_min(1)
+
+        # ---- Sequence-level advantage ----
+        # raw_advantages: token-level advantages A_{i,t}
+        # Mask padding tokens, sum over time, and normalise by sequence length
+        #
+        # This produces the scalar sequence advantage:
+        #   \bar A_i = (1 / |T_i|) * sum_t A_{i,t}
+        #
+        # This is the quantity used by V-MPO to weight entire trajectories.
         adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1) / valid_len
+
+        # Number of sequences in the batch
         num_seqs = adv_seq.numel()
+
+        # psi_global will store the token-level variational distribution ψ_{i,t}
+        # Same shape as raw_advantages: [batch, T]
         psi_global = torch.zeros_like(raw_advantages)
+
+        # Track η dual objective values for logging/debugging
         l_eta_full_values = []
+
+        # ---- Dual optimisation loop for η ----
+        # This solves:
+        #   min_η  η ( ε_η + log mean_i exp( \bar A_i / η ) )
+        #
+        # via gradient descent on η (parametrised through softplus)
         for _ in range(self.args.eta_inner_steps):
+
+            # Ensure η > 0 via softplus, plus a small floor for numerical safety
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
+
+            # Default zero loss (used if batch is empty)
             l_eta = torch.zeros((), device=device)
+
             if num_seqs > 0:
+                # Numerical stabilisation: subtract max advantage
+                # This does not change ψ, only prevents overflow
                 max_adv = adv_seq.max()
+
+                # Unnormalised sequence weights:
+                #   w_i = exp( (\bar A_i - max_adv) / η )
                 w_seq = torch.exp((adv_seq - max_adv) / (eta + 1e-8))
+
+                # Normalised variational distribution over sequences:
+                #   ψ_i = w_i / sum_j w_j
                 psi_seq = w_seq / w_seq.sum().clamp_min(1e-8)
+
+                # Broadcast sequence weights to token level:
+                #   ψ_{i,t} = ψ_i  for valid tokens
+                #   ψ_{i,t} = 0    for padding
+                #
+                # This enforces that ψ is constant along a trajectory,
+                # which is a defining feature of sequence-level V-MPO.
                 psi_global = psi_seq[:, None] * mask_valid
+
+                # Log-mean-exp term:
+                #   log(1/N * sum_i exp(\bar A_i / η))
+                #
+                # Implemented stably via logsumexp
                 log_mean_exp = torch.logsumexp(
                     adv_seq / (eta + 1e-8), dim=0
                 ) - math.log(num_seqs)
+
+                # Dual objective:
+                #   L(η) = η ( ε_η + log_mean_exp )
+                #
+                # Minimising this enforces the KL constraint on ψ.
                 l_eta = eta * (self.args.eps_eta + log_mean_exp)
+
+            # Gradient step on η
             self.eta_optimizer.zero_grad()
+
+            # l_eta requires grad unless the batch is degenerate
             if l_eta.requires_grad:
                 l_eta.backward()
                 self.eta_optimizer.step()
+
+                # Save detached value for logging
                 l_eta_full_values.append(l_eta.detach())
             else:
+                # No meaningful gradient signal → stop early
                 break
+
+        # Return:
+        # - psi_global: token-level variational weights ψ_{i,t}
+        # - l_eta_full_values: diagnostics for the η dual optimisation
         return psi_global, l_eta_full_values
+
+    def _m_step(
+        self,
+        *,
+        psi_global: torch.Tensor,
+        psi_state: torch.Tensor,
+        queries: torch.Tensor,
+        responses: torch.Tensor,
+        padding_mask_p1: torch.Tensor,
+        logprobs: torch.Tensor,
+        values: torch.Tensor,
+        returns: torch.Tensor,
+        context_length: int,
+        pg_losses: list,
+        vf_losses: list,
+        kl_weighted_accum: torch.Tensor,
+        kl_mb_count: int,
+    ) -> tuple[torch.Tensor, int, list, list, list]:
+        """ψ-weighted maximum likelihood policy optimisation under a dual-controlled KL trust region"""
+
+        kl_vals_last_mstep: list[torch.Tensor] = []
+
+        # Random permutation for minibatch SGD
+        b_inds = np.random.permutation(self.args.local_batch_size)
+
+        for start in range(0, len(b_inds), self.args.local_mini_batch_size):
+            mb_inds = b_inds[start : start + self.args.local_mini_batch_size]
+
+            # ---- Minibatch slicing ----
+            mb_query = queries[mb_inds]
+            mb_response = responses[mb_inds]
+            mb_query_response = torch.cat((mb_query, mb_response), 1)
+
+            psi_mb = psi_global[mb_inds]
+            psi_state_mb = psi_state[mb_inds]
+            mask_valid_mb = ~padding_mask_p1[mb_inds]
+
+            # ---- Policy forward ----
+            policy_outputs = forward(
+                self.model.policy,
+                mb_query_response,
+                self.processing_class.pad_token_id,
+            )
+            new_logits = policy_outputs.logits[:, context_length - 1 : -1]
+            new_logprobs = selective_log_softmax(new_logits, mb_response)
+
+            # ---- ψ-weighted policy loss ----
+            if psi_mb.sum() > 0:
+                policy_loss = -(
+                    (psi_mb * new_logprobs).sum()
+                    / (psi_mb.sum() + 1e-8)
+                )
+            else:
+                policy_loss = torch.zeros((), device=self.accelerator.device)
+
+            # ---- Value forward ----
+            value_full, _, _ = get_reward(
+                self.accelerator.unwrap_model(self.model).value_model,
+                mb_query_response,
+                self.processing_class.pad_token_id,
+                context_length,
+            )
+            value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
+            value_mask = mask_valid_mb
+
+            # ---- Value targets ----
+            with torch.no_grad():
+                value_old_mb = values[mb_inds]
+                returns_mb = returns[mb_inds]
+
+                if self.args.use_ppo_clip_value_targets:
+                    # PPO-style clipped value update
+                    delta = (returns_mb - value_old_mb).clamp(
+                        -self.args.value_clip,
+                        self.args.value_clip,
+                    )
+                    value_target = value_old_mb + delta
+                else:
+                    # Pure VMPO critic regression
+                    value_target = returns_mb
+
+            if value_mask.any():
+                value_loss = F.mse_loss(
+                    value_pred[value_mask],
+                    value_target[value_mask],
+                )
+            else:
+                value_loss = torch.zeros((), device=self.accelerator.device)
+
+            # ---- KL to reference policy ----
+            kl_terms_mb = (logprobs[mb_inds] - new_logprobs) * mask_valid_mb
+            kl_state_mb = kl_terms_mb.sum(dim=1) / (mask_valid_mb.sum(dim=1) + 1e-8)
+            kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
+
+            # ---- Combined M-step loss ----
+            alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
+            total_loss = (
+                policy_loss
+                + alpha.detach() * kl_weighted_mb
+                + (self.args.vf_coef / self.args.m_steps) * value_loss
+            )
+
+            self.accelerator.backward(total_loss)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+            # ---- Statistics ----
+            kl_weighted_accum += kl_weighted_mb.detach()
+            kl_mb_count += 1
+            pg_losses.append(policy_loss.detach())
+            vf_losses.append(value_loss.detach())
+            kl_vals_last_mstep.append(kl_weighted_mb.detach())
+
+        # ---- Dual update for α ----
+        self.alpha_optimizer.zero_grad()
+        if kl_mb_count > 0:
+            alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
+            kl_mean = kl_weighted_accum / kl_mb_count
+            l_alpha = -alpha * (kl_mean - self.args.eps_alpha)
+            l_alpha.backward()
+            self.alpha_optimizer.step()
+
+        return (
+            kl_weighted_accum,
+            kl_mb_count,
+            pg_losses,
+            vf_losses,
+            kl_vals_last_mstep,
+        )
 
     def generate_metrics(
         self,
