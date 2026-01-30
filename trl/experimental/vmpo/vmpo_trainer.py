@@ -240,10 +240,6 @@ class VMPOConfig(TrainingArguments):
         default=False,
         metadata={"help": "Whether to push the model to the Hub after training."},
     )
-    use_ppo_clip_value_targets: bool = field(
-        default=False,
-        metadata={"help": "Whether to use PPO clip value targets."},
-    )
     exp_name: str = field(
         default=os.path.basename(__file__)[:-3],
         metadata={"help": "Name of this experiment."},
@@ -506,47 +502,6 @@ class OnlineTrainerState(TrainerState):
     episode: int = 0
 
 
-def masked_mean(
-    values: torch.Tensor, mask: torch.Tensor, axis: bool | None = None
-) -> torch.Tensor:
-    """Compute mean of tensor with a masked values."""
-    if axis is not None:
-        return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
-    else:
-        return (values * mask).sum() / mask.sum()
-
-
-def masked_var(
-    values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True
-) -> torch.Tensor:
-    """Compute variance of tensor with masked values."""
-    mean = masked_mean(values, mask)
-    centered_values = values - mean
-    variance = masked_mean(centered_values**2, mask)
-    mask_sum = mask.sum()
-    if mask_sum == 0:
-        raise ValueError(
-            "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
-            "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
-        )
-    if unbiased and mask_sum > 1:
-        bessel_correction = mask_sum / (mask_sum - 1)
-        variance = variance * bessel_correction
-    return variance
-
-
-def masked_whiten(
-    values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = True
-) -> torch.Tensor:
-    """Whiten values with masked values."""
-    mean, var = masked_mean(values, mask), masked_var(values, mask)
-    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
-    if not shift_mean:
-        whitened += mean
-    return whitened
-
-
-# taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
     def __init__(self, policy, value_model) -> None:
@@ -1049,7 +1004,7 @@ class VMPOTrainer(BaseTrainer):
             # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
             logr = ref_logprobs - logprobs
             kl = -logr if self.args.kl_estimator == "k1" else (logr.exp() - 1) - logr
-            # trust region KL is handled by α; no PPO-style shaping
+            # trust region KL is handled by α
             rewards = torch.zeros_like(kl)
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
             actual_end = torch.where(
@@ -1492,19 +1447,7 @@ class VMPOTrainer(BaseTrainer):
 
             # ---- Value targets ----
             with torch.no_grad():
-                value_old_mb = values[mb_inds]
-                returns_mb = returns[mb_inds]
-
-                if self.args.use_ppo_clip_value_targets:
-                    # PPO-style clipped value update
-                    delta = (returns_mb - value_old_mb).clamp(
-                        -self.args.value_clip,
-                        self.args.value_clip,
-                    )
-                    value_target = value_old_mb + delta
-                else:
-                    # Pure VMPO critic regression
-                    value_target = returns_mb
+                value_target = returns[mb_inds]
 
             if value_mask.any():
                 value_loss = F.mse_loss(
