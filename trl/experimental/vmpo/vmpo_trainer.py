@@ -1331,13 +1331,14 @@ class VMPOTrainer(BaseTrainer):
 
         # ---- Sequence-level advantage ----
         # raw_advantages: token-level advantages A_{i,t}
-        # Mask padding tokens, sum over time, and normalise by sequence length
+        # Mask padding tokens, sum over time
         #
         # This produces the scalar sequence advantage:
-        #   \bar A_i = (1 / |T_i|) * sum_t A_{i,t}
+        #   \bar A_i = sum_t A_{i,t}
         #
         # This is the quantity used by V-MPO to weight entire trajectories.
-        adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1) / valid_len
+        adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1)
+        # Alternatively, if you want mean * length:
 
         # Number of sequences in the batch
         num_seqs = adv_seq.numel()
