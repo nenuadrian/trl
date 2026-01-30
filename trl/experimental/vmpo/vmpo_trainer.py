@@ -1060,7 +1060,7 @@ class VMPOTrainer(BaseTrainer):
             logr = ref_logprobs - logprobs
             kl = -logr if self.args.kl_estimator == "k1" else (logr.exp() - 1) - logr
             # trust region KL is handled by α; no PPO-style shaping
-            rewards = torch.zeros_like(kl)
+            rewards = torch.zeros_like(kl, device=device)
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
             actual_end = torch.where(
                 sequence_lengths_p1 < rewards.size(1),
@@ -1378,7 +1378,7 @@ class VMPOTrainer(BaseTrainer):
 
         # psi_global will store the token-level variational distribution ψ_{i,t}
         # Same shape as raw_advantages: [batch, T]
-        psi_global = torch.zeros_like(raw_advantages)
+        psi_global = torch.zeros_like(raw_advantages, device=device)
 
         # Track η dual objective values for logging/debugging
         l_eta_full_values = []
