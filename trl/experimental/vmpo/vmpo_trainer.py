@@ -274,10 +274,6 @@ class VMPOConfig(TrainingArguments):
         default=0.1,
         metadata={"help": "Value function coefficient."},
     )
-    value_clip: float = field(
-        default=0.2,
-        metadata={"help": "Clip range for value targets (±value_clip)."},
-    )
     gamma: float = field(
         default=0.99,
         metadata={"help": "Discount factor."},
@@ -502,6 +498,47 @@ class OnlineTrainerState(TrainerState):
     episode: int = 0
 
 
+def masked_mean(
+    values: torch.Tensor, mask: torch.Tensor, axis: bool | None = None
+) -> torch.Tensor:
+    """Compute mean of tensor with a masked values."""
+    if axis is not None:
+        return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
+    else:
+        return (values * mask).sum() / mask.sum()
+
+
+def masked_var(
+    values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True
+) -> torch.Tensor:
+    """Compute variance of tensor with masked values."""
+    mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values**2, mask)
+    mask_sum = mask.sum()
+    if mask_sum == 0:
+        raise ValueError(
+            "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
+            "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
+        )
+    if unbiased and mask_sum > 1:
+        bessel_correction = mask_sum / (mask_sum - 1)
+        variance = variance * bessel_correction
+    return variance
+
+
+def masked_whiten(
+    values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = True
+) -> torch.Tensor:
+    """Whiten values with masked values."""
+    mean, var = masked_mean(values, mask), masked_var(values, mask)
+    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
+
+
+# taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
     def __init__(self, policy, value_model) -> None:
@@ -1004,7 +1041,7 @@ class VMPOTrainer(BaseTrainer):
             # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
             logr = ref_logprobs - logprobs
             kl = -logr if self.args.kl_estimator == "k1" else (logr.exp() - 1) - logr
-            # trust region KL is handled by α
+            # trust region KL is handled by α; no PPO-style shaping
             rewards = torch.zeros_like(kl)
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
             actual_end = torch.where(
@@ -1106,7 +1143,6 @@ class VMPOTrainer(BaseTrainer):
         approxkl_stats = torch.zeros(stats_shape, device=device)
         pg_loss_stats = torch.zeros(stats_shape, device=device)
         vf_loss_stats = torch.zeros(stats_shape, device=device)
-        vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
         model.train()
 
         # trainer state initialization
@@ -1144,7 +1180,6 @@ class VMPOTrainer(BaseTrainer):
             approxkl_stats.zero_()
             pg_loss_stats.zero_()
             vf_loss_stats.zero_()
-            vf_clipfrac_stats.zero_()
             self.state.episode += 1 * self.args.batch_size
 
             (
@@ -1218,7 +1253,6 @@ class VMPOTrainer(BaseTrainer):
                 approxkl_stats[0] = torch.stack(kl_vals_last_mstep).mean()
             else:
                 approxkl_stats[0] = torch.zeros((), device=device)
-            vf_clipfrac_stats[0] = torch.zeros((), device=device)
             empty_cache()
 
             self.state.epoch = (
@@ -1237,7 +1271,6 @@ class VMPOTrainer(BaseTrainer):
                     approxkl_stats,
                     pg_loss_stats,
                     vf_loss_stats,
-                    vf_clipfrac_stats,
                     contain_eos_token_raw,
                     contain_eos_token_post,
                     device,
@@ -1510,7 +1543,6 @@ class VMPOTrainer(BaseTrainer):
         approxkl_stats: torch.Tensor,
         pg_loss_stats: torch.Tensor,
         vf_loss_stats: torch.Tensor,
-        vf_clipfrac_stats: torch.Tensor,
         contain_eos_token_raw: torch.Tensor,
         contain_eos_token_post: torch.Tensor,
         device: torch.device,
@@ -1564,9 +1596,6 @@ class VMPOTrainer(BaseTrainer):
             )
             metrics["loss/value_avg"] = (
                 self.accelerator.gather_for_metrics(vf_loss_stats).mean().item()
-            )
-            metrics["val/clipfrac_avg"] = (
-                self.accelerator.gather_for_metrics(vf_clipfrac_stats).mean().item()
             )
             metrics["dual/eta_grad_norm"] = eta_grad_norm
             metrics["dual/eta_value"] = (
