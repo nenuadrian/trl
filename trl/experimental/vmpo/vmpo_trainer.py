@@ -243,7 +243,7 @@ class VMPOConfig(TrainingArguments):
     use_ppo_clip_value_targets: bool = field(
         default=False,
         metadata={"help": "Whether to use PPO clip value targets."},
-    )  
+    )
     exp_name: str = field(
         default=os.path.basename(__file__)[:-3],
         metadata={"help": "Name of this experiment."},
@@ -1107,9 +1107,7 @@ class VMPOTrainer(BaseTrainer):
             nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
             delta = rewards[:, t] + self.args.gamma * nextvalues - values[:, t]
             not_done = ~padding_mask_p1[:, t]
-            lastgaelam = (
-                delta + self.args.gamma * self.args.lam * lastgaelam * not_done
-            )
+            lastgaelam = delta + self.args.gamma * self.args.lam * lastgaelam * not_done
             advantages_reversed.append(lastgaelam)
         raw_advantages = torch.stack(advantages_reversed[::-1], dim=1)
         returns = raw_advantages + values
@@ -1478,10 +1476,7 @@ class VMPOTrainer(BaseTrainer):
 
             # ---- ψ-weighted policy loss ----
             if psi_mb.sum() > 0:
-                policy_loss = -(
-                    (psi_mb * new_logprobs).sum()
-                    / (psi_mb.sum() + 1e-8)
-                )
+                policy_loss = -((psi_mb * new_logprobs).sum() / (psi_mb.sum() + 1e-8))
             else:
                 policy_loss = torch.zeros((), device=self.accelerator.device)
 
