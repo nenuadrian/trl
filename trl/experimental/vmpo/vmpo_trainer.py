@@ -1308,7 +1308,7 @@ class VMPOTrainer(BaseTrainer):
                     f"[VMPO] Reset eta to {self.args.eta_reset_value} at update {update}"
                 )
             self.accelerator.wait_for_everyone()
-            self.model.eta_raw.data = broadcast(self.model.eta_raw.data, src=0)
+            self.model.eta_raw.data = broadcast(self.model.eta_raw.data, 0)
 
             self.control = self.callback_handler.on_step_end(
                 self.args, self.state, self.control
