@@ -100,7 +100,6 @@ class VMPOConfig(TrainingArguments):
         metadata={"help": "Minimum value added after softplus to keep α positive."},
     )
 
-    # Parameters whose default values are overridden from TrainingArguments
     logging_steps: float = field(
         default=10,
         metadata={
