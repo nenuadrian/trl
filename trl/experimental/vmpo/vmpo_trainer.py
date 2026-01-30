@@ -332,7 +332,7 @@ def set_eta(model, eta_value: float):
     """
     Reset eta_raw so that softplus(eta_raw) ≈ eta_value.
     """
-    with torch.no_grad():
+    with torch.inference_mode():
         eta_raw_value = inv_softplus(
             torch.tensor(eta_value, device=model.eta_raw.device)
         )
@@ -381,7 +381,7 @@ def generate(
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def batch_generation(
     model: torch.nn.Module,
     queries: torch.Tensor,
@@ -514,46 +514,6 @@ class OnlineTrainerState(TrainerState):
     """
 
     episode: int = 0
-
-
-def masked_mean(
-    values: torch.Tensor, mask: torch.Tensor, axis: bool | None = None
-) -> torch.Tensor:
-    """Compute mean of tensor with a masked values."""
-    if axis is not None:
-        return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
-    else:
-        return (values * mask).sum() / mask.sum()
-
-
-def masked_var(
-    values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True
-) -> torch.Tensor:
-    """Compute variance of tensor with masked values."""
-    mean = masked_mean(values, mask)
-    centered_values = values - mean
-    variance = masked_mean(centered_values**2, mask)
-    mask_sum = mask.sum()
-    if mask_sum == 0:
-        raise ValueError(
-            "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
-            "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
-        )
-    if unbiased and mask_sum > 1:
-        bessel_correction = mask_sum / (mask_sum - 1)
-        variance = variance * bessel_correction
-    return variance
-
-
-def masked_whiten(
-    values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = True
-) -> torch.Tensor:
-    """Whiten values with masked values."""
-    mean, var = masked_mean(values, mask), masked_var(values, mask)
-    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
-    if not shift_mean:
-        whitened += mean
-    return whitened
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -916,7 +876,7 @@ class VMPOTrainer(BaseTrainer):
         device,
     ):
         data = next(iter_dataloader)
-        with torch.no_grad():
+        with torch.inference_mode():
             queries = data["input_ids"].to(device)
             context_length = queries.shape[1]
             responses = []
@@ -1027,8 +987,8 @@ class VMPOTrainer(BaseTrainer):
             values = torch.cat(values, 0)
             rollout_logits = torch.cat(rollout_logits, 0)
             del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
-            empty_cache()
             gc.collect()
+            torch.cuda.empty_cache()
 
             # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
             # Completions not passing that filter will receive a lower score.
@@ -1228,6 +1188,18 @@ class VMPOTrainer(BaseTrainer):
                 device,
             )
 
+            # ---- Compute value backbone features ONCE per update ----
+            with torch.inference_mode():
+                value_features_all = forward(
+                    self.accelerator.unwrap_model(self.model).value_model.base_model,
+                    torch.cat((queries, responses), dim=1),
+                    self.processing_class.pad_token_id,
+                ).hidden_states[-1]
+
+            # ---- KEEP: cleanup after collect_rollouts ----
+            gc.collect()
+            torch.cuda.empty_cache()
+
             psi_global, l_eta_full_values = self._e_step_dual_update(
                 padding_mask_p1=padding_mask_p1,
                 raw_advantages=raw_advantages,
@@ -1262,6 +1234,7 @@ class VMPOTrainer(BaseTrainer):
                     vf_losses=vf_losses,
                     kl_weighted_accum=kl_weighted_accum,
                     kl_mb_count=kl_mb_count,
+                    value_features_all=value_features_all,  # pass features
                 )
             if len(pg_losses) > 0:
                 pg_loss_stats[0] = torch.stack(pg_losses).mean()
@@ -1327,7 +1300,9 @@ class VMPOTrainer(BaseTrainer):
                 and (update - 1) % self.sample_generations_freq == 0
             ):
                 self.generate_completions(sampling=True)
-                empty_cache()
+                # Optionally, you may keep this cleanup after completions:
+                gc.collect()
+                torch.cuda.empty_cache()
             del (
                 responses,
                 logprobs,
@@ -1466,6 +1441,7 @@ class VMPOTrainer(BaseTrainer):
         vf_losses: list,
         kl_weighted_accum: torch.Tensor,
         kl_mb_count: int,
+        value_features_all: torch.Tensor,  # new argument
     ) -> tuple[torch.Tensor, int, list, list, list]:
         """ψ-weighted maximum likelihood policy optimisation under a dual-controlled KL trust region"""
 
@@ -1501,23 +1477,17 @@ class VMPOTrainer(BaseTrainer):
             else:
                 policy_loss = torch.zeros((), device=self.accelerator.device)
 
-            # ---- Value forward ----
-            with torch.no_grad():
-                value_features = forward(
-                    self.accelerator.unwrap_model(self.model).value_model.base_model,
-                    mb_query_response,
-                    self.processing_class.pad_token_id,
-                ).hidden_states[-1]
-
+            # ---- Value forward (use precomputed features) ----
+            value_features_mb = value_features_all[mb_inds]
             value_pred = (
                 self.accelerator.unwrap_model(self.model)
-                .value_model.score(value_features)
+                .value_model.score(value_features_mb)
                 .squeeze(-1)[:, context_length - 1 : -1]
             )
             value_mask = mask_valid_mb
 
             # ---- Value targets ----
-            with torch.no_grad():
+            with torch.inference_mode():
                 value_target = returns[mb_inds]
 
             if value_mask.any():
@@ -1544,9 +1514,13 @@ class VMPOTrainer(BaseTrainer):
             self.accelerator.backward(total_loss)
             self.optimizer.step()
             self.optimizer.zero_grad()
-            
+
             # ---- FORCE GRAPH DESTRUCTION (value path) ----
-            del value_pred
+            del policy_outputs
+            del new_logits, new_logprobs
+            del value_features_mb, value_pred
+            # Remove torch.cuda.empty_cache() here (was inside minibatch loop)
+            gc.collect()
             torch.cuda.empty_cache()
 
             # ---- Statistics ----
@@ -1590,7 +1564,7 @@ class VMPOTrainer(BaseTrainer):
         device: torch.device,
     ) -> dict[str, float]:
         """Generate a dictionary of training metrics for logging."""
-        with torch.no_grad():
+        with torch.inference_mode():
             if kl_mb_count > 0:
                 kl_weighted_post = kl_weighted_accum / kl_mb_count
             else:
@@ -1683,7 +1657,7 @@ class VMPOTrainer(BaseTrainer):
         ) as unwrapped_model:
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
-                with torch.no_grad():
+                with torch.inference_mode():
                     context_length = query.shape[1]
                     query_response, _ = batch_generation(
                         unwrapped_model.policy,
