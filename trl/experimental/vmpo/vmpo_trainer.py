@@ -783,7 +783,7 @@ class VMPOTrainer(BaseTrainer):
         self.optimizer.param_groups = [
             g for g in self.optimizer.param_groups if len(g["params"]) > 0
         ]
-        eta_lr = self.args.learning_rate
+        eta_lr = 0.3 * self.args.learning_rate
         alpha_lr = self.args.learning_rate
         self.eta_optimizer = torch.optim.Adam(
             [self.model.eta_raw],
