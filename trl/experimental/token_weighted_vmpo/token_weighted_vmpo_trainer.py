@@ -59,70 +59,6 @@ from ..utils import first_true_indices, get_reward
 class TokenWeightedVMPOTrainerConfig(TrainingArguments):
     r"""
     Configuration class for the [`experimental.token_weighted_vmpo_trainer.TokenWeightedVMPOTrainer`].
-
-    This class includes only the parameters that are specific to TokenWeightedVMPOTrainer training. For a full list of training arguments,
-    please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values in this class may
-    differ from those in [`~transformers.TrainingArguments`].
-
-    Using [`~transformers.HfArgumentParser`] we can turn this class into
-    [argparse](https://docs.python.org/3/library/argparse#module-argparse) arguments that can be specified on the
-    command line.
-
-    Parameters:
-        run_name (`str`, *optional*):
-            Name of the run.
-        dataset_num_proc (`int`, *optional*):
-            Number of processes to use for processing the dataset.
-        num_mini_batches (`int`, *optional*, defaults to `1`):
-            Number of minibatches to split a batch into.
-        total_episodes (`int`, *optional*):
-            Total number of episodes in the dataset.
-        local_rollout_forward_batch_size (`int`, *optional*, defaults to `64`):
-            Per rank no grad forward pass in the rollout phase.
-        num_sample_generations (`int`, *optional*, defaults to `10`):
-            Number of debugging samples generations (i.e., `generate_completions` calls) throughout training.
-        response_length (`int`, *optional*, defaults to `53`):
-            Length of the response.
-        stop_token (`str`, *optional*):
-            Specifies the stop token to use for text generation. This parameter is mutually exclusive with
-            `stop_token_id`.
-
-            - `None`: No stop token is applied, unless `stop_token_id` is specified.
-            - `'eos'`: Uses the tokenizer's `eos_token`.
-
-        stop_token_id (`int`, *optional*):
-            Specifies the ID of the stop token to use for text generation. If `None`, no stop token ID is applied,
-            unless `stop_token` is specified. This parameter is mutually exclusive with `stop_token`.
-        temperature (`float`, *optional*, defaults to `0.7`):
-            Sampling temperature.
-        missing_eos_penalty (`float`, *optional*):
-            Penalty applied to the score when the model fails to generate an EOS token. This is useful to encourage to
-            generate completions shorter than the maximum length (`max_new_tokens`). The penalty must be a positive
-            value.
-        sft_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
-            Path to the SFT model.
-        world_size (`int`, *optional*):
-            Number of processes (GPUs) to use for the training.
-        num_total_batches (`int`, *optional*):
-            Number of total batches to train.
-        micro_batch_size (`int`, *optional*):
-            Micro batch size across devices (HF's `per_device_train_batch_size` * `world_size`).
-        local_batch_size (`int`, *optional*):
-            Batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`).
-        batch_size (`int`, *optional*):
-            Batch size across devices (HF's `per_device_train_batch_size` * `world_size` *
-            `gradient_accumulation_steps`).
-        local_mini_batch_size (`int`, *optional*):
-            Mini batch size per GPU.
-        push_to_hub (`bool`, *optional*, defaults to `False`):
-            Whether to push the model to the Hub after training.
-        exp_name (`str`, *optional*, defaults to `os.path.basename(__file__)[:-3]`):
-            Name of this experiment.
-        reward_model_path (`str`, *optional*, defaults to `"EleutherAI/pythia-160m"`):
-            Path to the reward model.
-        value_clip (`float`, *optional*, defaults to `0.2`):
-            Clip range for value targets (±value_clip).
-
     """
 
     eps_eta: float = field(
@@ -172,6 +108,24 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         default=0.0,
         metadata={
             "help": "Entropy regularization coefficient β (only applied when ψ ESS < psi_ess_min_tokens). Set 0 to disable."
+        },
+    )
+    reward_spread_k: int = field(
+        default=1,
+        metadata={
+            "help": "Diffuse the terminal scalar reward over the last K response tokens (K=1 keeps old behavior)."
+        },
+    )
+    eta_lr_mult: float = field(
+        default=0.1,
+        metadata={
+            "help": "Learning-rate multiplier for η dual optimizer relative to policy learning rate."
+        },
+    )
+    alpha_lr_mult: float = field(
+        default=1.0,
+        metadata={
+            "help": "Learning-rate multiplier for α dual optimizer relative to policy learning rate."
         },
     )
 
@@ -388,6 +342,12 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             raise ValueError("`psi_ess_min_tokens` must be >= 1.")
         if self.entropy_beta < 0:
             raise ValueError("`entropy_beta` must be >= 0.")
+        if self.reward_spread_k < 1:
+            raise ValueError("`reward_spread_k` must be >= 1.")
+        if self.eta_lr_mult < 0:
+            raise ValueError("`eta_lr_mult` must be >= 0.")
+        if self.alpha_lr_mult < 0:
+            raise ValueError("`alpha_lr_mult` must be >= 0.")
         super().__post_init__()
 
 
@@ -858,8 +818,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         self.optimizer.param_groups = [
             g for g in self.optimizer.param_groups if len(g["params"]) > 0
         ]
-        eta_lr = self.args.learning_rate
-        alpha_lr = self.args.learning_rate
+        policy_lr = float(self.args.learning_rate)
+        eta_lr = policy_lr * float(self.args.eta_lr_mult)
+        alpha_lr = policy_lr * float(self.args.alpha_lr_mult)
+
         self.eta_optimizer = torch.optim.Adam(
             [self.model.eta_raw],
             lr=eta_lr,
@@ -1121,6 +1083,26 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 ref_logprobs, padding_mask, INVALID_LOGPROB
             )
 
+            # --- rollout diagnostics (sampling-time) ---
+            valid_token_mask = ~padding_mask
+
+            # Mean token logprob under the rollout policy (sampling proxy; NOT optimization entropy)
+            rollout_token_logprobs_mean = logprobs.sum() / (
+                valid_token_mask.sum() + 1e-8
+            )
+
+            # True token entropy of the rollout distribution from rollout logits (still sampling-time)
+            with torch.no_grad():
+                roll_logp = F.log_softmax(rollout_logits, dim=-1)
+                roll_p = roll_logp.exp()
+                roll_tok_entropy = -(roll_p * roll_logp).sum(dim=-1)  # [B, T]
+                rollout_entropy_mean = (
+                    roll_tok_entropy[valid_token_mask].mean()
+                    if valid_token_mask.any()
+                    else torch.zeros((), device=rollout_logits.device)
+                )
+            # --- end rollout diagnostics ---
+
             # --- entropy diagnostic: mean token logprob over valid (non-pad) response tokens ---
             valid_token_mask = ~padding_mask
             token_logprobs_mean = logprobs.sum() / (valid_token_mask.sum() + 1e-8)
@@ -1149,14 +1131,24 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 sequence_lengths_p1,
                 sequence_lengths,
             )
-            rewards[actual_start, actual_end] += scores
-            if self.args.eos_bonus > 0:
-                eos_positions = first_true_indices(postprocessed_responses == eos_id)
-                has_eos = contain_eos_token_post
-                batch_idx = torch.arange(rewards.size(0), device=rewards.device)[
-                    has_eos
-                ]
-                rewards[batch_idx, eos_positions[has_eos]] += self.args.eos_bonus
+
+            # Diffuse terminal reward over the final K tokens (avoids a single-token advantage spike)
+            K = int(self.args.reward_spread_k)
+            if K == 1:
+                rewards[actual_start, actual_end] += scores
+            else:
+                # spread over as many tail tokens as exist: k_eff = min(K, actual_end+1)
+                k_eff = torch.minimum(
+                    torch.full_like(actual_end, K),
+                    actual_end + 1,
+                ).to(dtype=scores.dtype)
+                score_per = scores / k_eff
+                for offset in range(K):
+                    m = actual_end >= offset
+                    if m.any():
+                        idx = actual_end[m] - offset
+                        rewards[actual_start[m], idx] += score_per[m]
+
             # logging masks/summaries
             reward_valid_mask = ~padding_mask_p1
             reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
@@ -1199,7 +1191,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             contain_eos_token_raw,
             contain_eos_token_post,
             rollout_logits,
-            token_logprobs_mean,  # new
+            rollout_token_logprobs_mean,
+            rollout_entropy_mean,
         )
 
     def _m_step(
@@ -1210,15 +1203,16 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         queries: torch.Tensor,
         responses: torch.Tensor,
         padding_mask_p1: torch.Tensor,
-        logprobs: torch.Tensor,
+        old_logprobs_for_kl: torch.Tensor,  # recomputed per M-step pass
         values: torch.Tensor,
         returns: torch.Tensor,
         context_length: int,
         pg_losses: list,
         vf_losses: list,
+        entropy_stats: list,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, list, list, list]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list, list, list, list]:
         kl_vals_last_mstep: list[torch.Tensor] = []
         b_inds = np.random.permutation(self.args.local_batch_size)
         for start in range(0, len(b_inds), self.args.local_mini_batch_size):
@@ -1236,6 +1230,18 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             )
             new_logits = policy_outputs.logits[:, context_length - 1 : -1]
             new_logprobs = selective_log_softmax(new_logits, mb_response)
+
+            # True optimization-time policy entropy diagnostic (current policy on current minibatch)
+            with torch.no_grad():
+                logp_all = F.log_softmax(new_logits, dim=-1)
+                p_all = logp_all.exp()
+                token_entropy = -(p_all * logp_all).sum(dim=-1)  # [mb, T]
+                entropy_mb = (
+                    token_entropy[mask_valid_mb].mean()
+                    if mask_valid_mb.any()
+                    else torch.zeros((), device=new_logits.device)
+                )
+                entropy_stats.append(entropy_mb.detach())
 
             psi_mass_mb = psi_mb.sum()
             if psi_mass_mb > 0:
@@ -1258,16 +1264,19 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     -self.args.value_clip, self.args.value_clip
                 )
                 value_target = value_old_mb + delta
-            if value_mask.any():
-                value_loss = F.mse_loss(
-                    value_pred[value_mask],
-                    value_target[value_mask],
-                )
+
+            # ψ-weighted critic loss (EM-consistent): E_ψ[(V - target)^2]
+            weight = psi_mb * value_mask.to(dtype=psi_mb.dtype)
+            denom = weight.sum().clamp_min(1e-8)
+            if denom > 0:
+                value_loss = (((value_pred - value_target) ** 2) * weight).sum() / denom
             else:
                 value_loss = torch.zeros((), device=self.accelerator.device)
 
-            # expected KL under token-level ψ (use rollout logprobs as "old")
-            kl_terms_token = (logprobs[mb_inds] - new_logprobs) * mask_valid_mb
+            # expected KL under token-level ψ (use per-pass old_logprobs, not rollout logprobs)
+            kl_terms_token = (
+                old_logprobs_for_kl[mb_inds] - new_logprobs
+            ) * mask_valid_mb
             kl_num_mb = (psi_mb * kl_terms_token).sum()
             kl_den_mb = psi_mass_mb.clamp_min(1e-8)
             kl_mean_mb = kl_num_mb / kl_den_mb
@@ -1281,12 +1290,11 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             # Conditional entropy regularization (only if ESS is low for this rollout)
             if apply_entropy_reg and self.args.entropy_beta > 0.0:
-                logp_all = F.log_softmax(new_logits, dim=-1)
-                p_all = logp_all.exp()
-                token_entropy = -(p_all * logp_all).sum(dim=-1)  # [mb, T]
+                # reuse the already-computed token_entropy/logp_all/p_all shape logic
                 if mask_valid_mb.any():
-                    entropy = token_entropy[mask_valid_mb].mean()
-                    total_loss = total_loss + (-self.args.entropy_beta * entropy)
+                    total_loss = total_loss + (
+                        -self.args.entropy_beta * token_entropy[mask_valid_mb].mean()
+                    )
 
             self.accelerator.backward(total_loss)
             self.optimizer.step()
@@ -1312,6 +1320,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             pg_losses,
             vf_losses,
             kl_vals_last_mstep,
+            entropy_stats,
         )
 
     def train(self):
@@ -1408,7 +1417,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 contain_eos_token_raw,
                 contain_eos_token_post,
                 rollout_logits,
-                token_logprobs_mean,  # new
+                rollout_token_logprobs_mean,
+                rollout_entropy_mean,
             ) = self.collect_rollouts(
                 generation_kwargs,
                 accelerator,
@@ -1444,67 +1454,60 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             kl_weighted_num_accum = torch.zeros((), device=device)
             kl_weighted_den_accum = torch.zeros((), device=device)
-            pg_losses, vf_losses, kl_vals_last_mstep = [], [], []
+            pg_losses, vf_losses, kl_vals_last_mstep, entropy_stats = [], [], [], []
 
             for _ in range(self.args.m_steps):
+                # Recompute "old" logprobs under the current policy snapshot (before this pass's updates)
+                with torch.no_grad():
+                    query_responses = torch.cat((queries, responses), 1)
+                    old_logprobs_chunks = []
+                    bs = query_responses.shape[0]
+                    step_bs = int(self.args.local_rollout_forward_batch_size)
+                    for i in range(0, bs, step_bs):
+                        qr = query_responses[i : i + step_bs]
+                        out = forward(
+                            self.model.policy,
+                            qr,
+                            self.processing_class.pad_token_id,
+                        )
+                        old_logits = out.logits[:, context_length - 1 : -1]
+                        old_lp = selective_log_softmax(
+                            old_logits, responses[i : i + step_bs]
+                        )
+                        old_logprobs_chunks.append(old_lp)
+                    old_logprobs_for_kl = torch.cat(old_logprobs_chunks, dim=0)
+
                 (
                     kl_weighted_num_accum,
                     kl_weighted_den_accum,
                     pg_losses,
                     vf_losses,
                     kl_vals_last_mstep,
+                    entropy_stats,
                 ) = self._m_step(
                     psi_global=psi_global,
                     apply_entropy_reg=apply_entropy_reg,
                     queries=queries,
                     responses=responses,
                     padding_mask_p1=padding_mask_p1,
-                    logprobs=logprobs,
+                    old_logprobs_for_kl=old_logprobs_for_kl,
                     values=values,
                     returns=returns,
                     context_length=context_length,
                     pg_losses=pg_losses,
                     vf_losses=vf_losses,
+                    entropy_stats=entropy_stats,
                     kl_weighted_num_accum=kl_weighted_num_accum,
                     kl_weighted_den_accum=kl_weighted_den_accum,
                 )
-            if len(pg_losses) > 0:
-                pg_loss_stats[0] = torch.stack(pg_losses).mean()
-            if len(vf_losses) > 0:
-                vf_loss_stats[0] = torch.stack(vf_losses).mean()
-            if len(kl_vals_last_mstep) > 0:
-                approxkl_stats[0] = torch.stack(kl_vals_last_mstep).mean()
-            else:
-                approxkl_stats[0] = torch.zeros((), device=device)
-            vf_clipfrac_stats[0] = torch.zeros((), device=device)
-            empty_cache()
-
-            self.state.epoch = (
-                self.state.episode / self.train_dataset_len
-            )  # used by self.log
-            self.state.global_step += 1
-            self.log(
-                self.generate_metrics(
-                    kl_weighted_num_accum,
-                    kl_weighted_den_accum,
-                    reward_seq,
-                    reward_tok,
-                    psi_global,
-                    l_eta_full_values,
-                    scores,
-                    approxkl_stats,
-                    pg_loss_stats,
-                    vf_loss_stats,
-                    vf_clipfrac_stats,
-                    contain_eos_token_raw,
-                    contain_eos_token_post,
-                    token_logprobs_mean,
-                    device,
-                )
+            policy_entropy_mean = (
+                torch.stack(entropy_stats).mean()
+                if len(entropy_stats) > 0
+                else torch.zeros((), device=device)
             )
 
-            self.lr_scheduler.step()
-            self.control = self.callback_handler.on_step_end(
+            # HF trainer specifics
+            self.control = self.callback_handler.on_train_end(
                 self.args, self.state, self.control
             )
             if self.control.should_save:
@@ -1550,14 +1553,17 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
     ) -> tuple[torch.Tensor, list]:
         # token-level ψ_{i,t} ∝ exp(A_{i,t} / η), only over valid tokens, with Σ ψ = 1
         mask_valid = ~padding_mask_p1  # [B, T]
-        A = raw_advantages             # [B, T]
+        A = raw_advantages  # [B, T]
         psi_global = torch.zeros_like(A)
         l_eta_full_values: list[torch.Tensor] = []
 
-        A_valid = A[mask_valid]        # [N_tok]
+        A_valid = A[mask_valid]  # [N_tok]
         n_tok = A_valid.numel()
         if n_tok == 0:
             return psi_global, l_eta_full_values
+
+        # Center advantages over valid tokens (reduces sensitivity to reward scale/offset drift)
+        A_valid = A_valid - A_valid.mean()
 
         if self.args.psi_topk_ratio is None or self.args.psi_topk_ratio >= 1.0:
             mask_topk = torch.ones_like(A_valid, dtype=torch.bool)
@@ -1571,7 +1577,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         if n_sel == 0:
             return psi_global, l_eta_full_values
 
-        # Dual optimization over η (token-level log-mean-exp, restricted to selected support)
+        # Compensate eps_eta for top-k truncation to keep η behavior consistent as n_sel changes
+        effective_eps_eta = self.args.eps_eta + math.log(n_tok / n_sel)
+
         for _ in range(self.args.eta_inner_steps):
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
             A_max = A_sel.max()
@@ -1579,7 +1587,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             Z = weights.sum().clamp_min(1e-8)
 
             log_mean_exp = torch.log(Z) + (A_max / (eta + 1e-8)) - math.log(n_sel)
-            l_eta = eta * (self.args.eps_eta + log_mean_exp)
+            l_eta = eta * (effective_eps_eta + log_mean_exp)
 
             self.eta_optimizer.zero_grad()
             l_eta.backward()
@@ -1615,12 +1623,16 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         vf_clipfrac_stats: torch.Tensor,
         contain_eos_token_raw: torch.Tensor,
         contain_eos_token_post: torch.Tensor,
-        token_logprobs_mean: torch.Tensor,
+        rollout_token_logprobs_mean: torch.Tensor,
+        rollout_entropy_mean: torch.Tensor,
+        policy_entropy_mean: torch.Tensor,
         device: torch.device,
     ) -> dict[str, float]:
         """Generate a dictionary of training metrics for logging."""
         with torch.no_grad():
-            kl_weighted_post = kl_weighted_num_accum / (kl_weighted_den_accum.clamp_min(1e-8))
+            kl_weighted_post = kl_weighted_num_accum / (
+                kl_weighted_den_accum.clamp_min(1e-8)
+            )
 
             rlhf_reward = reward_seq.mean()
             eta_value = F.softplus(self.model.eta_raw) + self.args.eta_min
@@ -1697,8 +1709,22 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
             metrics["episode"] = self.state.episode
 
-            metrics["policy/token_logprobs_mean"] = (
-                self.accelerator.gather_for_metrics(token_logprobs_mean).mean().item()
+            # rollout/sampling-time diagnostics (do not interpret as optimization entropy)
+            metrics["rollout/token_logprobs_mean"] = (
+                self.accelerator.gather_for_metrics(rollout_token_logprobs_mean)
+                .mean()
+                .item()
+            )
+            metrics["rollout/entropy_tok_mean"] = (
+                self.accelerator.gather_for_metrics(rollout_entropy_mean).mean().item()
+            )
+            metrics["deprecated/policy_token_logprobs_mean"] = metrics[
+                "rollout/token_logprobs_mean"
+            ]
+
+            # optimization-time diagnostic: current policy entropy on training minibatches
+            metrics["policy/entropy_tok_mean"] = (
+                self.accelerator.gather_for_metrics(policy_entropy_mean).mean().item()
             )
 
             # Optional sanity checks for truncation (won't error if disabled)
