@@ -1352,7 +1352,7 @@ class VMCPOTrainer(BaseTrainer):
         )
 
         return output
-    
+
     def _m_step(
         self, logps: torch.Tensor, ref_logps: torch.Tensor, psi: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1680,9 +1680,6 @@ class VMCPOTrainer(BaseTrainer):
 
         l_alpha = self.alpha_dual_update(kl_weighted.detach(), update=updating)
 
-        if self.args.rpo_alpha is not None and "nll_loss" in model_output:
-            loss = loss + self.args.rpo_alpha * model_output["nll_loss"]
-
         if self.aux_loss_enabled and "router_aux_loss" in model_output:
             loss = loss + self.aux_loss_coef * model_output["router_aux_loss"]
 
@@ -1766,13 +1763,6 @@ class VMCPOTrainer(BaseTrainer):
             .item()
         )
 
-        if self.args.rpo_alpha is not None and "nll_loss" in model_output:
-            metrics[f"{prefix}nll_loss"] = (
-                self.accelerator.gather_for_metrics(model_output["nll_loss"])
-                .detach()
-                .mean()
-                .item()
-            )
         if self.aux_loss_enabled and "router_aux_loss" in model_output:
             metrics[f"{prefix}aux_loss"] = (
                 self.accelerator.gather_for_metrics(model_output["router_aux_loss"])
