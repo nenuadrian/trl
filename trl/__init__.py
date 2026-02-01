@@ -62,6 +62,7 @@ _import_structure = {
         "CPOTrainer",  # deprecated import
         "DPOConfig",
         "DPOTrainer",
+        "VMCPOConfig",
         "VMCPOTrainer",
         "FDivergenceConstants",
         "FDivergenceType",
@@ -149,6 +150,8 @@ if TYPE_CHECKING:
         GKDTrainer,  # deprecated import
         GRPOConfig,
         GRPOTrainer,
+        VMCPOTrainer,
+        VMCPOConfig,
         HfPairwiseJudge,  # deprecated import
         KTOConfig,
         KTOTrainer,
