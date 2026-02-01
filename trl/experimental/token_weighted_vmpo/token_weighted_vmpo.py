@@ -1229,6 +1229,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             rollout_logits,
             rollout_token_logprobs_mean,
             rollout_entropy_mean,
+            reward_mean_raw,
         )
 
     def _m_step(
@@ -1485,6 +1486,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 rollout_logits,
                 rollout_token_logprobs_mean,
                 rollout_entropy_mean,
+                reward_mean_raw,
             ) = self.collect_rollouts(
                 generation_kwargs,
                 accelerator,
