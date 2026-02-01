@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .token_weighted_vmpo_trainer import TokenWeightedVMPOTrainerConfig, TokenWeightedVMPOTrainer
+from .token_weighted_vmpo import TokenWeightedVMPOTrainerConfig, TokenWeightedVMPOTrainer
 
 
 __all__ = [

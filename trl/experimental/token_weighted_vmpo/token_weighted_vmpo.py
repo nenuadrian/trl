@@ -1406,7 +1406,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             self.args, self.state, self.control
         )
 
-        for update in range(1, 100):
+        for update in range(1, self.args.num_total_batches + 1):
             approxkl_stats.zero_()
             pg_loss_stats.zero_()
             vf_loss_stats.zero_()
