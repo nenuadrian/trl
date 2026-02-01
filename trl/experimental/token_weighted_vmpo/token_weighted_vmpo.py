@@ -1199,7 +1199,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         queries: torch.Tensor,
         responses: torch.Tensor,
         padding_mask_p1: torch.Tensor,
-        old_logprobs_for_kl: torch.Tensor,  # recomputed per M-step pass
+        rollout_logprobs: torch.Tensor,  # rollout snapshot; frozen for KL
         values: torch.Tensor,
         returns: torch.Tensor,
         context_length: int,
@@ -1270,9 +1270,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             else:
                 value_loss = torch.zeros((), device=self.accelerator.device)
 
-            # expected KL under token-level ψ (use per-pass old_logprobs, not rollout logprobs)
+            # expected KL under token-level ψ (use rollout snapshot logprobs; do NOT recompute per M-step)
             kl_terms_token = (
-                old_logprobs_for_kl[mb_inds] - new_logprobs
+                rollout_logprobs[mb_inds] - new_logprobs
             ) * mask_valid_mb
             kl_num_mb = (psi_mb * kl_terms_token).sum()
             kl_den_mb = psi_mass_mb.clamp_min(1e-8)
@@ -1468,26 +1468,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             pg_losses, vf_losses, kl_vals_last_mstep, entropy_stats = [], [], [], []
 
             for _ in range(self.args.m_steps):
-                # Recompute "old" logprobs under the current policy snapshot (before this pass's updates)
-                with torch.no_grad():
-                    query_responses = torch.cat((queries, responses), 1)
-                    old_logprobs_chunks = []
-                    bs = query_responses.shape[0]
-                    step_bs = int(self.args.local_rollout_forward_batch_size)
-                    for i in range(0, bs, step_bs):
-                        qr = query_responses[i : i + step_bs]
-                        out = forward(
-                            self.model.policy,
-                            qr,
-                            self.processing_class.pad_token_id,
-                        )
-                        old_logits = out.logits[:, context_length - 1 : -1]
-                        old_lp = selective_log_softmax(
-                            old_logits, responses[i : i + step_bs]
-                        )
-                        old_logprobs_chunks.append(old_lp)
-                    old_logprobs_for_kl = torch.cat(old_logprobs_chunks, dim=0)
-
                 (
                     kl_weighted_num_accum,
                     kl_weighted_den_accum,
@@ -1502,7 +1482,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     queries=queries,
                     responses=responses,
                     padding_mask_p1=padding_mask_p1,
-                    old_logprobs_for_kl=old_logprobs_for_kl,
+                    rollout_logprobs=logprobs,
                     values=values,
                     returns=returns,
                     context_length=context_length,
