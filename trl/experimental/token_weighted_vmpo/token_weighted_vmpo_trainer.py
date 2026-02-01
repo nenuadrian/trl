@@ -56,11 +56,11 @@ from ..utils import first_true_indices, get_reward
 
 
 @dataclass
-class VMPPPOConfig(TrainingArguments):
+class TokenWeightedVMPOTrainerConfig(TrainingArguments):
     r"""
-    Configuration class for the [`experimental.vmpppo.VMPPPOTrainer`].
+    Configuration class for the [`experimental.token_weighted_vmpo_trainer.TokenWeightedVMPOTrainer`].
 
-    This class includes only the parameters that are specific to VMPPPO training. For a full list of training arguments,
+    This class includes only the parameters that are specific to TokenWeightedVMPOTrainer training. For a full list of training arguments,
     please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values in this class may
     differ from those in [`~transformers.TrainingArguments`].
 
@@ -618,11 +618,11 @@ class PolicyAndValueWrapper(nn.Module):
         return self.policy(**kwargs), logits
 
 
-class VMPPPOTrainer(BaseTrainer):
-    """Trainer for VMPPPO.
+class TokenWeightedVMPOTrainer(BaseTrainer):
+    """Trainer for TokenWeightedVMPOTrainer.
 
     Args:
-        args ([`experimental.vmpppo.VMPPPOConfig`]):
+        args ([`experimental.token_weighted_vmpo_trainer.TokenWeightedVMPOTrainerConfig`]):
             Training arguments.
         processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`]):
             Class to process the data.
@@ -652,14 +652,14 @@ class VMPPPOTrainer(BaseTrainer):
             will be wrapped with the specified PEFT adapter.
     """
 
-    _tag_names = ["trl", "vmpppo"]
-    _name = "VMPPPO"
+    _tag_names = ["trl", "token_weighted_vmpo_trainer"]
+    _name = "TokenWeightedVMPOTrainer"
     _paper = {
         "title": "V-MPO: On-Policy Maximum a Posteriori Policy Optimization for Discrete and Continuous Control",
-        "id": "song2019vmpppoonpolicymaximumposteriori",
+        "id": "song2019token_weighted_vmpo_traineronpolicymaximumposteriori",
         "citation": textwrap.dedent(
             """\
-            @misc{song2019vmpppoonpolicymaximumposteriori,
+            @misc{song2019token_weighted_vmpo_traineronpolicymaximumposteriori,
                 title={V-MPO: On-Policy Maximum a Posteriori Policy Optimization for Discrete and Continuous Control}, 
                 author={H. Francis Song and Abbas Abdolmaleki and Jost Tobias Springenberg and Aidan Clark and Hubert Soyer and Jack W. Rae and Seb Noury and Arun Ahuja and Siqi Liu and Dhruva Tirumala and Nicolas Heess and Dan Belov and Martin Riedmiller and Matthew M. Botvinick},
                 year={2019},
@@ -673,7 +673,7 @@ class VMPPPOTrainer(BaseTrainer):
 
     def __init__(
         self,
-        args: VMPPPOConfig,
+        args: TokenWeightedVMPOTrainerConfig,
         processing_class: (
             PreTrainedTokenizerBase
             | BaseImageProcessor

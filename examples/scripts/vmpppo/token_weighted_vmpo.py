@@ -41,7 +41,10 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.experimental.vmpppo import VMPPPOConfig, VMPPPOTrainer
+from trl.experimental.token_weighted_vmpo import (
+    TokenWeightedVMPOTrainerConfig,
+    TokenWeightedVMPOTrainer,
+)
 
 
 # Enable logging in a Hugging Face Space
@@ -49,7 +52,9 @@ os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((ScriptArguments, VMPPPOConfig, ModelConfig))
+    parser = HfArgumentParser(
+        (ScriptArguments, TokenWeightedVMPOTrainerConfig, ModelConfig)
+    )
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
     # remove output_dir if exists
     shutil.rmtree(training_args.output_dir, ignore_errors=True)
@@ -146,7 +151,7 @@ if __name__ == "__main__":
     ################
     # Training
     ################
-    trainer = VMPPPOTrainer(
+    trainer = TokenWeightedVMPOTrainer(
         args=training_args,
         processing_class=tokenizer,
         model=policy,

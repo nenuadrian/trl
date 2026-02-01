@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .vmpppo_trainer import VMPPPOTrainer, VMPPPOConfig
+from .token_weighted_vmpo_trainer import TokenWeightedVMPOTrainerConfig, TokenWeightedVMPOTrainer
 
 
 __all__ = [
-    "VMPPPOConfig",
-    "VMPPPOTrainer",
+    "TokenWeightedVMPOTrainerConfig",
+    "TokenWeightedVMPOTrainer",
 ]

@@ -281,7 +281,7 @@ class VMCPOConfig(TrainingArguments):
         },
     )
     m_steps: int = field(
-        default=1,
+        default=3,
         metadata={
             "help": "Number of policy/value gradient steps (M-step iterations) to perform per batch of preference data."
         },
