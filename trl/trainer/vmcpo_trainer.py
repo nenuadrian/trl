@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import math
 import random
 import textwrap
 from collections import defaultdict
@@ -24,7 +25,6 @@ from typing import Any, Literal
 
 
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any
 
 import transformers
@@ -42,554 +42,6 @@ from torch import autocast
 from torch.utils.data import DataLoader
 from transformers import (
     AutoProcessor,
-    BaseImageProcessor,
-    DataCollator,
-    FeatureExtractionMixin,
-    PreTrainedModel,
-    PreTrainedTokenizerBase,
-    ProcessorMixin,
-    TrainerCallback,
-)
-from transformers.data.data_collator import DataCollatorMixin
-from transformers.integrations import (
-    is_comet_available,
-    is_mlflow_available,
-    is_wandb_available,
-)
-from transformers.models.auto.modeling_auto import (
-    MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
-)
-from transformers.trainer_utils import EvalLoopOutput
-from transformers.utils import is_liger_kernel_available, is_peft_available
-
-from ..data_utils import (
-    is_conversational,
-    maybe_apply_chat_template,
-    maybe_extract_prompt,
-)
-from ..models import create_reference_model, prepare_deepspeed
-from ..models.utils import peft_module_casting_to_bf16, prepare_fsdp
-from .base_trainer import BaseTrainer
-from .callbacks import SyncRefModelCallback
-from .utils import (
-    RunningMoments,
-    cap_exp,
-    create_model_from_path,
-    disable_dropout_in_model,
-    empty_cache,
-    flush_left,
-    flush_right,
-    get_config_model_id,
-    log_table_to_comet_experiment,
-    pad,
-    pad_to_length,
-    selective_log_softmax,
-)
-
-
-if is_peft_available():
-    from peft import (
-        PeftConfig,
-        PeftModel,
-        get_peft_model,
-        prepare_model_for_kbit_training,
-    )
-
-if is_liger_kernel_available():
-    from liger_kernel.chunked_loss import LigerFusedLinearVMCPOLoss
-
-
-if is_wandb_available():
-    import wandb
-
-if is_mlflow_available():
-    import mlflow
-
-
-logger = logging.get_logger(__name__)
-
-
-def shift_tokens_right(
-    input_ids: torch.Tensor, decoder_start_token_id: int
-) -> torch.Tensor:
-    """Shift input ids one token to the right, and pad with pad_token_id"""
-    shifted_input_ids = input_ids.new_zeros(input_ids.shape)
-    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
-    shifted_input_ids[:, 0] = decoder_start_token_id
-    return shifted_input_ids
-
-
-class FDivergenceType(Enum):
-    """Types of f-divergence functions for VMCPO loss regularization.
-
-    Attributes:
-        REVERSE_KL: Reverse KL divergence.
-        JS_DIVERGENCE: Jensen-Shannon divergence.
-        ALPHA_DIVERGENCE: Alpha divergence.
-
-    Examples:
-        ```python
-        >>> from trl.trainer.vmcpo_config import VMCPOConfig, FDivergenceType
-
-        >>> config = VMCPOConfig(
-        ...     f_divergence_type=FDivergenceType.ALPHA_DIVERGENCE,
-        ...     f_alpha_divergence_coef=0.5,  # used only with ALPHA_DIVERGENCE
-        ... )
-        ```
-    """
-
-    REVERSE_KL = "reverse_kl"
-    JS_DIVERGENCE = "js_divergence"
-    ALPHA_DIVERGENCE = "alpha_divergence"
-
-
-class FDivergenceConstants:
-    """Constants for f-divergence types and their parameters.
-
-    Attributes:
-        ALPHA_DIVERGENCE_COEF_KEY (`str`): Key for the alpha divergence coefficient.
-        ALPHA_DIVERGENCE_COEF_DEFAULT (`float`): Default value for the alpha divergence coefficient.
-    """
-
-    ALPHA_DIVERGENCE_COEF_KEY = "alpha_divergence_coef"
-    ALPHA_DIVERGENCE_COEF_DEFAULT = 1.0
-
-
-@dataclass
-class VMCPOConfig(TrainingArguments):
-    r"""
-    Configuration class for the [`VMCPOTrainer`].
-
-    This class includes only the parameters that are specific to VMCPO training. For a full list of training arguments,
-    please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values in this class may
-    differ from those in [`~transformers.TrainingArguments`].
-
-    Using [`~transformers.HfArgumentParser`] we can turn this class into
-    [argparse](https://docs.python.org/3/library/argparse#module-argparse) arguments that can be specified on the
-    command line.
-
-    Parameters:
-        > Parameters that control the model and reference model
-
-        model_init_kwargs (`dict[str, Any]`, *optional*):
-            Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `model` argument of the
-            [`VMCPOTrainer`] is provided as a string.
-        ref_model_init_kwargs (`dict[str, Any]`, *optional*):
-            Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `ref_model` argument of the
-            [`VMCPOTrainer`] is provided as a string.
-        model_adapter_name (`str`, *optional*):
-            Name of the train target PEFT adapter, when using LoRA with multiple adapters.
-        ref_adapter_name (`str`, *optional*):
-            Name of the reference PEFT adapter, when using LoRA with multiple adapters.
-        force_use_ref_model (`bool`, *optional*, defaults to `False`):
-            If you provide a PEFT model as the active model and wish to use a different model for the `ref_model`, set
-            this flag to `True`.
-        disable_dropout (`bool`, *optional*, defaults to `True`):
-            Whether to disable dropout in the model and reference model.
-        use_logits_to_keep (`bool`, *optional*, defaults to `False`):
-            If `True`, only a specified number of logits are computed in the forward pass. This can be useful for
-            saving memory and speeding up training by not computing the logits for all tokens, especially in scenarios
-            when working with very long prompts where labels are ignored (-100).
-
-        > Parameters that control the data preprocessing
-
-        dataset_num_proc (`int`, *optional*):
-            Number of processes to use for processing the dataset.
-        pad_token (`str`, *optional*):
-            Token used for padding. If `None`, it defaults to `processing_class.pad_token`, or if that is also `None`,
-            it falls back to `processing_class.eos_token`.
-        label_pad_token_id (`int`, *optional*, defaults to `-100`):
-            Padding value to use for labels.
-        max_prompt_length (`int` or `None`, *optional*, defaults to `512`):
-            Maximum length of the prompt.
-        max_completion_length (`int`, *optional*):
-            Maximum length of the completion.
-        max_length (`int` or `None`, *optional*, defaults to `1024`):
-            Maximum length of the full sequence (prompt + completion).
-        truncation_mode (`str`, *optional*, defaults to `"keep_end"`):
-            Truncation mode to use when the sequence exceeds `max_length`. Possible values are `"keep_end"` and
-            `"keep_start"`.
-        padding_free (`bool`, *optional*, defaults to `False`):
-            Whether to perform forward passes without padding by flattening all sequences in the batch into a single
-            continuous sequence. This reduces memory usage by eliminating padding overhead. Currently, this is only
-            supported with the `flash_attention_2` attention implementation, which can efficiently handle the flattened
-            batch structure.
-        precompute_ref_log_probs (`bool`, *optional*, defaults to `False`):
-            Whether to precompute the log probabilities from the reference model. Setting this to `True` allows
-            training without needing the reference model during training, which can help reduce GPU memory usage. If
-            set to `False` (default), the reference model will be used during training to compute log probabilities
-            on-the-fly.
-        precompute_ref_batch_size (`int`, *optional*):
-            Batch size to use when precomputing reference model log probabilities. This can be set higher than the
-            training batch size to speed up preprocessing. If `None`, defaults to `per_device_train_batch_size` for
-            training and `per_device_eval_batch_size` for evaluation.
-        tools (`list[dict] | None`, *optional*):
-            List of tools (callable functions) that will be accessible to the model. If the template does not support
-            function calling, this argument will have no effect.
-
-        > Parameters that control the training
-
-        loss_type (`str` or `list[str]`, *optional*, defaults to `"sigmoid"`):
-            Type of loss to use. Possible values are:
-
-                - `"sigmoid"`: sigmoid loss from the original [VMCPO](https://huggingface.co/papers/2305.18290) paper.
-                - `"hinge"`: hinge loss on the normalized likelihood from the
-                  [SLiC](https://huggingface.co/papers/2305.10425) paper.
-                - `"ipo"`: IPO loss from the [IPO](https://huggingface.co/papers/2310.12036) paper.
-                - `"exo_pair"`: pairwise EXO loss from the [EXO](https://huggingface.co/papers/2402.00856) paper.
-                - `"nca_pair"`: pairwise NCA loss from the [NCA](https://huggingface.co/papers/2402.05369) paper.
-                - `"robust"`: unbiased estimate of the VMCPO loss that is robust to preference noise from the [Robust
-                  VMCPO](https://huggingface.co/papers/2403.00409) paper.
-                - `"bco_pair"`: pairwise BCO loss from the [BCO](https://huggingface.co/papers/2404.04656) paper.
-                - `"sppo_hard"`: SPPO loss with hard label from the [SPPO](https://huggingface.co/papers/2405.00675)
-                  paper.
-                - `"aot"`: AOT loss for paired datasets from the [AOT](https://huggingface.co/papers/2406.05882) paper.
-                - `"aot_pair"`: AOT loss for unpaired datasets from the [AOT](https://huggingface.co/papers/2406.05882)
-                  paper.
-                - `"discopop"`: DiscoPOP (a.k.a Log-Ratio Modulated Loss, LRML) loss from the
-                  [DiscoPOP](https://huggingface.co/papers/2406.08414) paper.
-                - `"apo_zero"`: APO-zero loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
-                - `"apo_down"`: APO-down loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
-                - `"sft"`: Negative log-likelihood loss (standard supervised fine-tuning loss).
-
-            Multiple loss types can be combined using comma separation (e.g., `["sigmoid", "bco_pair", "sft"]` for
-            [MPO](https://huggingface.co/papers/2411.10442)). The `loss_weights` parameter can be used to specify
-            corresponding weights for each loss type.
-        base_model_attribute_name (`str`, *optional*, defaults to `"model"`):
-            Name of the attribute in the model that contains the base model. This is used to get the base model from
-            the model when the model does not have a `get_decoder` method in the case when `use_liger_kernel` is
-            `True`.
-        beta (`float`, *optional*, defaults to `0.1`):
-            Parameter controlling the deviation from the reference model. Higher β means less deviation from the
-            reference model. For the IPO loss (`loss_type="ipo"`), β is the regularization parameter denoted by τ in
-            the [paper](https://huggingface.co/papers/2310.12036).
-        f_divergence_type ([`FDivergenceType`] or `str`, *optional*, defaults to `FDivergenceType.REVERSE_KL`):
-            Type of f-divergence regularization function to compute divergence between policy and reference model.
-        f_alpha_divergence_coef (`float`, *optional*, defaults to `1.0`):
-            α coefficient in the α-divergence u^-α regularization function for VMCPO loss.
-        reference_free (`bool`, *optional*, defaults to `False`):
-            Whether to ignore the provided reference model and implicitly use a reference model that assigns equal
-            probability to all responses.
-        label_smoothing (`float`, *optional*, defaults to `0.0`):
-            Robust VMCPO label smoothing parameter from the [cVMCPO report](https://ericmitchell.ai/cvmcpo.pdf) and [Robust
-            VMCPO](https://huggingface.co/papers/2403.00409) paper that should be between `0.0` and `0.5`.
-        use_weighting (`bool`, *optional*, defaults to `False`):
-            Whether to weight the loss as done in the [WPO paper](https://huggingface.co/papers/2406.11827).
-        rpo_alpha (`float`, *optional*):
-            α parameter from the [RPO paper](https://huggingface.co/papers/2404.19733) (v3), which controls the
-            weighting of the NLL term in the loss. If `None`, no weighting is applied and the loss is the same as the
-            VMCPO loss. The paper recommends `rpo_alpha=1.0`.
-        ld_alpha (`float`, *optional*):
-            α parameter from the [LD-VMCPO paper](https://huggingface.co/papers/2409.06411), which controls the weighting
-            of the verbose token log-probabilities in responses. If `None`, no weighting is applied to the verbose
-            part, and the loss is equivalent to the standard VMCPO loss. The paper recommends setting `ld_alpha` between
-            `0.0` and `1.0`.
-        discopop_tau (`float`, *optional*, defaults to `0.05`):
-            τ/temperature parameter from the [DiscoPOP](https://huggingface.co/papers/2406.08414) paper, which controls
-            the shape of log ratio modulated loss. The paper recommends the default value `discopop_tau=0.05`.
-        loss_weights (`list[float]`, *optional*):
-            List of loss weights for multi-loss combinations. Used when combining multiple loss types. Example: `[0.8,
-            0.2, 1.0]` for [MPO](https://huggingface.co/papers/2411.10442). If not provided, defaults to equal weights
-            (`1.0`) for all loss types.
-        sync_ref_model (`bool`, *optional*, defaults to `False`):
-            Whether to synchronize the reference model with the active model every `ref_model_sync_steps` steps, using
-            the `ref_model_mixup_alpha` parameter. This synchronization originates from the
-            [TR-VMCPO](https://huggingface.co/papers/2404.09656) paper.
-        ref_model_mixup_alpha (`float`, *optional*, defaults to `0.6`):
-            α parameter from the [TR-VMCPO](https://huggingface.co/papers/2404.09656) paper, which controls the mix
-            between the current policy and the previous reference policy during updates. The reference policy is
-            updated according to the equation: `π_ref = α * π_θ + (1 - α) * π_ref_prev`. To use this parameter, you
-            must set `sync_ref_model=True`.
-        ref_model_sync_steps (`int`, *optional*, defaults to `512`):
-            τ parameter from the [TR-VMCPO](https://huggingface.co/papers/2404.09656) paper, which determines how
-            frequently the current policy is synchronized with the reference policy. To use this parameter, you must
-            set `sync_ref_model=True`.
-
-        > Parameters that control the logging
-
-        generate_during_eval (`bool`, *optional*, defaults to `False`):
-            Whether to generate and log completions from both the model and the reference model to W&B or Comet during
-            evaluation.
-    """
-
-    _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + [
-        "model_init_kwargs",
-        "ref_model_init_kwargs",
-    ]
-
-    # Parameters whose default values are overridden from TrainingArguments
-    learning_rate: float = field(
-        default=1e-6,
-        metadata={"help": "The initial learning rate for AdamW."},
-    )
-    logging_steps: float = field(
-        default=10,
-        metadata={
-            "help": "Log every X updates steps. Should be an integer or a float in range `[0,1)`. If smaller than 1, "
-            "will be interpreted as ratio of total training steps."
-        },
-    )
-    gradient_checkpointing: bool = field(
-        default=True,
-        metadata={
-            "help": "If True, use gradient checkpointing to save memory at the expense of slower backward pass."
-        },
-    )
-    bf16: bool | None = field(
-        default=None,
-        metadata={
-            "help": "Whether to use bf16 (mixed) precision instead of 32-bit. Requires Ampere or higher NVIDIA "
-            "architecture or Intel XPU or using CPU (use_cpu) or Ascend NPU. If not set, it defaults to `True` if "
-            "`fp16` is not set."
-        },
-    )
-    # Transformers 4.57.0 introduced a bug that caused the dtype of `lr_scheduler_kwargs` to be unparsable. This issue
-    # was fixed in https://github.com/huggingface/transformers/pull/41322 and released in 4.57.5. We add a temporary
-    # workaround here, which can be removed once we drop support for versions older than 4.57.5.
-    lr_scheduler_kwargs: dict | str | None = field(
-        default=None,
-        metadata={
-            "help": "Additional parameters for the lr_scheduler, such as {'num_cycles': 1} for cosine with hard "
-            "restarts."
-        },
-    )
-
-    # Parameters that control the model and reference model
-    model_init_kwargs: dict[str, Any] | None = field(
-        default=None,
-        metadata={
-            "help": "Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `model` argument of "
-            "the `VMCPOTrainer` is provided as a string."
-        },
-    )
-    ref_model_init_kwargs: dict[str, Any] | None = field(
-        default=None,
-        metadata={
-            "help": "Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `ref_model` argument "
-            "of the `VMCPOTrainer` is provided as a string."
-        },
-    )
-    model_adapter_name: str | None = field(
-        default=None,
-        metadata={
-            "help": "Name of the train target PEFT adapter, when using LoRA with multiple adapters."
-        },
-    )
-    ref_adapter_name: str | None = field(
-        default=None,
-        metadata={
-            "help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."
-        },
-    )
-    force_use_ref_model: bool = field(
-        default=False,
-        metadata={
-            "help": "If you provide a PEFT model as the active model and wish to use a different model for the "
-            "`ref_model`, set this flag to `True`."
-        },
-    )
-    disable_dropout: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to disable dropout in the model and reference model."
-        },
-    )
-    use_logits_to_keep: bool = field(
-        default=False,
-        metadata={
-            "help": "If `True`, only a specified number of logits are computed in the forward pass. This can be "
-            "useful for saving memory and speeding up training by not computing the logits for all tokens, especially "
-            "in scenarios when working with very long prompts where labels are ignored (-100)."
-        },
-    )
-
-    # Parameters that control the data preprocessing
-    dataset_num_proc: int | None = field(
-        default=None,
-        metadata={"help": "Number of processes to use for processing the dataset."},
-    )
-    pad_token: str | None = field(
-        default=None,
-        metadata={
-            "help": "Token used for padding. If `None`, it defaults to `processing_class.pad_token`, or if that "
-            "is also `None`, it falls back to `processing_class.eos_token`."
-        },
-    )
-    label_pad_token_id: int = field(
-        default=-100,
-        metadata={"help": "Padding value to use for labels."},
-    )
-    max_prompt_length: int | None = field(
-        default=512,
-        metadata={"help": "Maximum length of the prompt."},
-    )
-    max_completion_length: int | None = field(
-        default=None,
-        metadata={"help": "Maximum length of the completion."},
-    )
-    max_length: int | None = field(
-        default=1024,
-        metadata={"help": "Maximum length of the full sequence (prompt + completion)."},
-    )
-    truncation_mode: str = field(
-        default="keep_end",
-        metadata={
-            "help": "Truncation mode to use when the sequence exceeds `max_length`. Possible values are `'keep_end'` "
-            "and `'keep_start'`.",
-            "choices": ["keep_end", "keep_start"],
-        },
-    )
-    padding_free: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to perform forward passes without padding by flattening all sequences in the batch into "
-            "a single continuous sequence. This reduces memory usage by eliminating padding overhead. Currently, "
-            "this is only supported with the `flash_attention_2` attention implementation, which can efficiently "
-            "handle the flattened batch structure."
-        },
-    )
-    precompute_ref_log_probs: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to precompute the log probabilities from the reference model. Setting this to `True` "
-            "allows training without needing the reference model during training, which can help reduce GPU memory "
-            "usage. If set to `False` (default), the reference model will be used during training to compute log "
-            "probabilities on-the-fly."
-        },
-    )
-    precompute_ref_batch_size: int | None = field(
-        default=None,
-        metadata={
-            "help": "Batch size to use when precomputing reference model log probabilities. This can be set higher "
-            "than the training batch size to speed up preprocessing. If `None`, defaults to "
-            "`per_device_train_batch_size` for training and `per_device_eval_batch_size` for evaluation."
-        },
-    )
-    tools: list[dict] | None = field(
-        default=None,
-        metadata={
-            "help": "List of tools (callable functions) that will be accessible to the model. If the template does "
-            "not support function calling, this argument will have no effect."
-        },
-    )
-
-    # Parameters that control the training
-    loss_type: list[str] = field(
-        default_factory=lambda: ["sigmoid"],
-        metadata={
-            "help": "Type of loss to use. Possible values are: `'sigmoid'`, `'hinge'`, `'ipo'`, `'exo_pair'`, "
-            "`'nca_pair'`, `'robust'`, `'bco_pair'`, `'sppo_hard'`, `'aot'`, `'aot_pair'`, `'discopop'`, "
-            "`'apo_zero'`, `'apo_down'` and `'sft'`. Multiple loss types can be combined using comma separation "
-            "(e.g., `['sigmoid', 'bco_pair', 'sft']` for MPO). The `loss_weights` parameter can be used to specify "
-            "corresponding weights for each loss type."
-        },
-    )
-    base_model_attribute_name: str = field(
-        default="model",
-        metadata={
-            "help": "Name of the attribute in the model that contains the base model. This is used to get the base "
-            "model  from the model when the model does not have a `get_decoder` method in the case when "
-            "`use_liger_kernel` is `True`."
-        },
-    )
-    beta: float = field(
-        default=0.1,
-        metadata={
-            "help": "Parameter controlling the deviation from the reference model. "
-            "Higher β means less deviation from the reference model."
-        },
-    )
-    f_divergence_type: FDivergenceType | str = field(
-        default=FDivergenceType.REVERSE_KL,
-        metadata={
-            "help": "Type of f-divergence regularization function to compute divergence between policy and reference "
-            "model."
-        },
-    )
-    f_alpha_divergence_coef: float = field(
-        default=1.0,
-        metadata={
-            "help": "α coefficient in the α-divergence u^-α regularization function for VMCPO loss."
-        },
-    )
-    reference_free: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to ignore the provided reference model and implicitly use a reference model that assigns "
-            "equal probability to all responses."
-        },
-    )
-    label_smoothing: float = field(
-        default=0.0,
-        metadata={
-            "help": "Robust VMCPO label smoothing parameter from the cVMCPO report and Robust VMCPO paper that should "
-            "be between `0.0` and `0.5`."
-        },
-    )
-    use_weighting: bool = field(
-        default=False,
-        metadata={"help": "Whether to weight the loss as done in the WPO paper."},
-    )
-    rpo_alpha: float | None = field(
-        default=None,
-        metadata={
-            "help": "α parameter from the RPO paper (v3), which controls the weighting of the NLL term in the loss. "
-            "If `None`, no weighting is applied and the loss is the same as the VMCPO loss. The paper recommends "
-            "`rpo_alpha=1.0`."
-        },
-    )
-    ld_alpha: float | None = field(
-        default=None,
-        metadata={
-            "help": "α parameter from the LD-VMCPO paper, which controls the weighting of the verbose token "
-            "log-probabilities in responses. If `None`, no weighting is applied to the verbose part, and the loss is "
-            "equivalent to the standard VMCPO loss. The paper recommends setting `ld_alpha` between `0.0` and `1.0`.",
-        },
-    )
-    discopop_tau: float = field(
-        default=0.05,
-        metadata={
-            "help": "τ/temperature parameter from the DiscoPOP paper, which controls the shape of log ratio modulated "
-            "loss. The paper recommends the default value `discopop_tau=0.05`."
-        },
-    )
-    loss_weights: list[float] | None = field(
-        default=None,
-        metadata={
-            "help": "List of loss weights for multi-loss combinations. Used when combining multiple loss types. "
-            "Example: `[0.8, 0.2, 1.0]` for MPO. If not provided, defaults to equal weights (`1.0`) for all loss "
-            "types."
-        },
-    )
-    sync_ref_model: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to synchronize the reference model with the active model every `ref_model_sync_steps` "
-            "steps, using the `ref_model_mixup_alpha` parameter."
-        },
-    )
-    ref_model_mixup_alpha: float = field(
-        default=0.6,
-        metadata={
-            "help": "α parameter from the TR-VMCPO paper, which controls the mix between the current policy and the "
-            "previous reference policy during updates. The reference policy is updated according to the equation: "
-            "`π_ref = α * π_θ + (1 - α) * π_ref_prev`. To use this parameter, you must set `sync_ref_model=True`."
-        },
-    )
-    ref_model_sync_steps: int = field(
-        default=512,
-        metadata={
-            "help": "τ parameter from the TR-VMCPO paper, which determines how frequently the current policy is "
-            "synchronized with the reference policy. To use this parameter, you must set `sync_ref_model=True`."
-        },
-    )
-
-    # Parameters that control the logging
-    generate_during_eval: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to generate and log completions from both the model and the reference model to W&B, MLFLow "
-            "or Comet during evaluation."
         },
     )
 
@@ -607,23 +59,6 @@ class VMCPOConfig(TrainingArguments):
                 self.gradient_checkpointing_kwargs or {}
             )
             self.gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
-
-        self.f_divergence_type = FDivergenceType(self.f_divergence_type)
-
-        # Normalize loss_type to string format for internal use
-        if hasattr(self.loss_type, "__len__") and len(self.loss_type) == 1:
-            self.loss_type = self.loss_type[0]
-
-        # Validate loss_type
-        if self.loss_weights is not None:
-            loss_types = (
-                self.loss_type if isinstance(self.loss_type, list) else [self.loss_type]
-            )
-            if len(self.loss_weights) != len(loss_types):
-                raise ValueError(
-                    f"Length of loss_weights list ({self.loss_weights}) must match number of loss types "
-                    f"({loss_types})."
-                )
 
         super().__post_init__()
 
@@ -975,28 +410,8 @@ class VMCPOTrainer(BaseTrainer):
 
         # Liger kernel
         if args.use_liger_kernel:
-            if not is_liger_kernel_available():
-                raise ImportError(
-                    "You set `use_liger_kernel=True` but the liger kernel is not available. "
-                    "Please install liger-kernel first: `pip install liger-kernel`"
-                )
-            if args.loss_type not in [
-                "sigmoid",
-                "apo_zero",
-                "apo_down",
-                "sppo_hard",
-                "nca_pair",
-            ]:
-                raise ValueError(
-                    "You set `use_liger_kernel=True` but the loss type is not from `[sigmoid, apo_zero, apo_down, sppo_hard, nca_pair`. "
-                    "Please set `loss_type='[sigmoid | apo_zero | apo_down | sppo_hard | nca_pair]'` to use the liger kernel."
-                )
-            self.vmcpo_loss_fn = LigerFusedLinearVMCPOLoss(
-                ignore_index=args.label_pad_token_id,
-                beta=args.beta,
-                use_ref_model=not args.reference_free,
-                average_log_prob=False,
-                loss_type=args.loss_type,
+            raise ValueError(
+                "VMCPOTrainer no longer supports `use_liger_kernel=True`. VMPO training always follows the torch implementation."
             )
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in VMCPO, the sampled data does not include the
@@ -1044,11 +459,6 @@ class VMCPOTrainer(BaseTrainer):
         self._precomputed_eval_ref_log_probs = False
 
         self.beta = args.beta
-        self.label_smoothing = args.label_smoothing
-        self.loss_type = (
-            args.loss_type if isinstance(args.loss_type, list) else [args.loss_type]
-        )
-        self.loss_weights = args.loss_weights
         self.aux_loss_enabled = getattr(model.config, "output_router_logits", False)
         self.use_weighting = args.use_weighting
         self.aux_loss_coef = getattr(model.config, "router_aux_loss_coef", 0.0)
@@ -1059,35 +469,8 @@ class VMCPOTrainer(BaseTrainer):
                 "greater than `0.0`, or set `output_router_logits` to `False` if you don't want to use the auxiliary "
                 "loss.",
             )
-        for loss_type in self.loss_type:
-            if (
-                loss_type
-                in [
-                    "hinge",
-                    "ipo",
-                    "bco_pair",
-                    "sppo_hard",
-                    "nca_pair",
-                    "apo_zero",
-                    "apo_down",
-                ]
-                and args.label_smoothing > 0
-            ):
-                logger.warning(
-                    f"You are using the {loss_type} loss type that does not support label smoothing. The "
-                    "`label_smoothing` parameter will be ignored. Set `label_smoothing` to `0.0` to remove this "
-                    "warning.",
-                )
-            if loss_type == "kto_pair":
-                raise ValueError(
-                    "Support for kto_pair has been removed in VMCPOTrainer. Please use KTOTrainer."
-                )
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
-        self.f_divergence_type = args.f_divergence_type
-        self.f_divergence_params = {
-            FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY: args.f_alpha_divergence_coef
-        }
         self.dataset_num_proc = args.dataset_num_proc
 
         # Dataset preparation
@@ -1123,6 +506,20 @@ class VMCPOTrainer(BaseTrainer):
         # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
         # self.model_accepts_loss_kwargs to False to enable scaling.
         self.model_accepts_loss_kwargs = False
+
+        device = self.accelerator.device
+        self.eta_raw = nn.Parameter(
+            inv_softplus(torch.tensor(args.eta_init, device=device))
+        )
+        self.alpha_raw = nn.Parameter(
+            inv_softplus(torch.tensor(args.alpha_init, device=device))
+        )
+        self.eta_optimizer = torch.optim.Adam(
+            [self.eta_raw], lr=args.learning_rate, weight_decay=0.0
+        )
+        self.alpha_optimizer = torch.optim.Adam(
+            [self.alpha_raw], lr=args.learning_rate, weight_decay=0.0
+        )
 
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
@@ -1173,9 +570,6 @@ class VMCPOTrainer(BaseTrainer):
                     ref_model=self.ref_model, accelerator=self.accelerator
                 )
             )
-
-        if "bco_pair" in self.loss_type:
-            self.running = RunningMoments(self.accelerator)
 
     def _prepare_peft_model(
         self,
@@ -1750,317 +1144,6 @@ class VMCPOTrainer(BaseTrainer):
 
         return output
 
-    def vmcpo_loss(
-        self,
-        chosen_logps: torch.FloatTensor,
-        rejected_logps: torch.FloatTensor,
-        ref_chosen_logps: torch.FloatTensor,
-        ref_rejected_logps: torch.FloatTensor,
-        loss_type: str = "sigmoid",
-        model_output: dict[str, torch.FloatTensor] = None,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-        """
-        Compute the VMCPO loss for a batch of policy and reference model log probabilities.
-
-        Args:
-            chosen_logps (`torch.FloatTensor`):
-                Log probabilities of the model for the chosen responses. Shape: `(batch_size,)`.
-            rejected_logps (`torch.FloatTensor`):
-                Log probabilities of the model for the rejected responses. Shape: `(batch_size,)`.
-            ref_chosen_logps (`torch.FloatTensor`):
-                Log probabilities of the reference model for the chosen responses. Shape: `(batch_size,)`.
-            ref_rejected_logps (`torch.FloatTensor`):
-                Log probabilities of the reference model for the rejected responses. Shape: `(batch_size,)`.
-            loss_type (`str`, defaults to `"sigmoid"`):
-                The type of loss to compute. One of:
-                - `"sigmoid"`: Sigmoid loss from the original [VMCPO](https://huggingface.co/papers/2305.18290) paper.
-                - `"hinge"`: Hinge loss on the normalized likelihood from the
-                  [SLiC](https://huggingface.co/papers/2305.10425) paper.
-                - `"ipo"`: IPO loss from the [IPO](https://huggingface.co/papers/2310.12036) paper.
-                - `"exo_pair"`: Pairwise EXO loss from the [EXO](https://huggingface.co/papers/2402.00856) paper.
-                - `"nca_pair"`: Pairwise NCA loss from the [NCA](https://huggingface.co/papers/2402.05369) paper.
-                - `"robust"`: Unbiased estimate of the VMCPO loss that is robust to preference noise from the [Robust
-                  VMCPO](https://huggingface.co/papers/2403.00409) paper.
-                - `"bco_pair"`: Pairwise BCO loss from the [BCO](https://huggingface.co/papers/2404.04656) paper.
-                - `"sppo_hard"`: SPPO loss with hard label from the [SPPO](https://huggingface.co/papers/2405.00675)
-                  paper.
-                - `"aot"`: AOT loss for paired datasets from the [AOT](https://huggingface.co/papers/2406.05882) paper.
-                - `"aot_pair"`: AOT loss for unpaired datasets from the [AOT](https://huggingface.co/papers/2406.05882)
-                  paper.
-                - `"discopop"`: DiscoPOP (a.k.a Log-Ratio Modulated Loss, LRML) loss from the
-                  [DiscoPOP](https://huggingface.co/papers/2406.08414) paper.
-                - `"apo_zero"`: APO-zero loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
-                - `"apo_down"`: APO-down loss from the [APO](https://huggingface.co/papers/2408.06266) paper.
-                - `"sft"`: Negative log-likelihood loss (standard supervised fine-tuning loss).
-            model_output (`dict[str, torch.FloatTensor]`, *optional*):
-                The output of the model's forward pass. This is used to compute auxiliary losses if enabled.
-
-        Returns:
-            A tuple of three tensors: `(losses, chosen_rewards, rejected_rewards)`. The losses tensor contains the VMCPO
-            loss for each example in the batch. The `chosen_rewards` and `rejected_rewards` tensors contain the rewards
-            for the chosen and rejected responses, respectively.
-        """
-        device = self.accelerator.device
-
-        # Get the log ratios for the chosen and rejected responses
-        chosen_logratios = chosen_logps.to(device) - (
-            not self.reference_free
-        ) * ref_chosen_logps.to(device)
-        rejected_logratios = rejected_logps.to(device) - (
-            not self.reference_free
-        ) * ref_rejected_logps.to(device)
-
-        if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE:
-            # The alpha-divergence formula: (1 - u^-alpha) / alpha
-            # The divergence difference between the chosen and rejected sample is:
-            #     (1 - u[w]^-alpha) / alpha - (1 - u[l]^-alpha) / alpha
-            #        = (u[l]^-alpha - u[w]^-alpha) / alpha
-            # where u[w] and u[l] are the policy/reference probability ratios
-            # for the chosen and rejected samples, respectively.
-            alpha_coef = FDivergenceConstants.ALPHA_DIVERGENCE_COEF_DEFAULT
-            if (
-                self.f_divergence_params
-                and FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY
-                in self.f_divergence_params
-            ):
-                alpha_coef = float(
-                    self.f_divergence_params[
-                        FDivergenceConstants.ALPHA_DIVERGENCE_COEF_KEY
-                    ]
-                )
-            logits = (
-                cap_exp(rejected_logratios * -alpha_coef)
-                - cap_exp(chosen_logratios * -alpha_coef)
-            ) / alpha_coef
-        else:
-            logratios = chosen_logps - rejected_logps
-            if self.reference_free:
-                ref_logratios = torch.tensor(
-                    [0], dtype=logratios.dtype, device=logratios.device
-                )
-            else:
-                ref_logratios = ref_chosen_logps - ref_rejected_logps
-
-            logratios = logratios.to(self.accelerator.device)
-            ref_logratios = ref_logratios.to(self.accelerator.device)
-            logits = logratios - ref_logratios
-
-            if self.f_divergence_type == FDivergenceType.JS_DIVERGENCE:
-                # The js-divergence formula: log(2 * u / (1 + u))
-                # The divergence difference between the chosen and rejected sample is:
-                #     log(2 * u[w] / (1 + u[w])) - log(2 * u[l] / (1 + u[l]))
-                #       = log(u[w]) - log(u[l]) - (log(1 + u[w]) - log(1 + u[l]))
-                # where u[w] and u[l] are the policy/reference probability ratios
-                # for the chosen and rejected samples, respectively.
-                logits -= F.softplus(chosen_logratios) - F.softplus(rejected_logratios)
-
-        # The beta is a temperature parameter for the VMCPO loss, typically something in the range of 0.1 to 0.5.
-        # We ignore the reference model as beta -> 0. The label_smoothing parameter encodes our uncertainty about the
-        # labels and calculates a conservative VMCPO loss.
-        if loss_type == "sigmoid":
-            losses = (
-                -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
-                - F.logsigmoid(-self.beta * logits) * self.label_smoothing
-            )
-
-        elif loss_type == "robust":
-            losses = (
-                -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
-                + F.logsigmoid(-self.beta * logits) * self.label_smoothing
-            ) / (1 - 2 * self.label_smoothing)
-
-        elif loss_type == "exo_pair":
-            # eqn (16) of the EXO paper: https://huggingface.co/papers/2402.00856
-            import math
-
-            if self.label_smoothing == 0:
-                self.label_smoothing = 1e-3
-            losses = (self.beta * logits).sigmoid() * (
-                F.logsigmoid(self.beta * logits) - math.log(1 - self.label_smoothing)
-            ) + (-self.beta * logits).sigmoid() * (
-                F.logsigmoid(-self.beta * logits) - math.log(self.label_smoothing)
-            )
-
-        elif loss_type == "hinge":
-            losses = torch.relu(1 - self.beta * logits)
-
-        elif loss_type == "ipo":
-            # eqn (17) of the paper where beta is the regularization parameter for the IPO loss, denoted by tau in the paper.
-            losses = (logits - 1 / (2 * self.beta)) ** 2
-
-        elif loss_type == "bco_pair":
-            chosen_logratios = chosen_logps - ref_chosen_logps
-            rejected_logratios = rejected_logps - ref_rejected_logps
-            chosen_rewards = self.beta * chosen_logratios
-            rejected_rewards = self.beta * rejected_logratios
-            rewards = torch.cat((chosen_rewards, rejected_rewards), 0).mean().detach()
-            self.running.update(rewards)
-            delta = self.running.mean
-            losses = -F.logsigmoid(
-                (self.beta * chosen_logratios) - delta
-            ) - F.logsigmoid(-(self.beta * rejected_logratios - delta))
-
-        elif loss_type == "sppo_hard":
-            # In the paper (https://huggingface.co/papers/2405.00675), SPPO employs a soft probability approach,
-            # estimated using the PairRM score. The probability calculation is conducted outside of the trainer class.
-            # The version described here is the hard probability version, where P in Equation (4.7) of Algorithm 1 is
-            # set to 1 for the winner and 0 for the loser.
-            a = chosen_logps - ref_chosen_logps
-            b = rejected_logps - ref_rejected_logps
-            losses = (a - 0.5 / self.beta) ** 2 + (b + 0.5 / self.beta) ** 2
-
-        elif loss_type == "nca_pair":
-            chosen_rewards = (chosen_logps - ref_chosen_logps) * self.beta
-            rejected_rewards = (rejected_logps - ref_rejected_logps) * self.beta
-            losses = (
-                -F.logsigmoid(chosen_rewards)
-                - 0.5 * F.logsigmoid(-chosen_rewards)
-                - 0.5 * F.logsigmoid(-rejected_rewards)
-            )
-
-        elif loss_type == "aot_pair":
-            chosen_logratios = chosen_logps - ref_chosen_logps
-            rejected_logratios = rejected_logps - ref_rejected_logps
-            chosen_logratios_sorted, _ = torch.sort(chosen_logratios, dim=0)
-            rejected_logratios_sorted, _ = torch.sort(rejected_logratios, dim=0)
-            delta = chosen_logratios_sorted - rejected_logratios_sorted
-            losses = (
-                -F.logsigmoid(self.beta * delta) * (1 - self.label_smoothing)
-                - F.logsigmoid(-self.beta * delta) * self.label_smoothing
-            )
-
-        elif loss_type == "aot":
-            logratios = chosen_logps - rejected_logps
-            ref_logratios = ref_chosen_logps - ref_rejected_logps
-            logratios_sorted, _ = torch.sort(logratios, dim=0)
-            ref_logratios_sorted, _ = torch.sort(ref_logratios, dim=0)
-            delta = logratios_sorted - ref_logratios_sorted
-            losses = (
-                -F.logsigmoid(self.beta * delta) * (1 - self.label_smoothing)
-                - F.logsigmoid(-self.beta * delta) * self.label_smoothing
-            )
-
-        elif loss_type == "apo_zero":
-            # Eqn (7) of the APO paper (https://huggingface.co/papers/2408.06266)
-            # Use this loss when you believe the chosen outputs are better than your model's default output
-            losses_chosen = 1 - F.sigmoid(
-                self.beta * chosen_logratios
-            )  # Increase chosen likelihood
-            losses_rejected = F.sigmoid(
-                self.beta * rejected_logratios
-            )  # Decrease rejected likelihood
-            losses = losses_chosen + losses_rejected
-
-        elif loss_type == "apo_down":
-            # Eqn (8) of the APO paper (https://huggingface.co/papers/2408.06266)
-            # Use this loss when you believe the chosen outputs are worse than your model's default output.
-            # Decrease chosen likelihood and decrease rejected likelihood more
-            losses_chosen = F.sigmoid(self.beta * chosen_logratios)
-            losses_rejected = 1 - F.sigmoid(
-                self.beta * (chosen_logratios - rejected_logratios)
-            )
-            losses = losses_chosen + losses_rejected
-
-        elif loss_type == "discopop":
-            # Eqn (5) of the DiscoPOP paper (https://huggingface.co/papers/2406.08414)
-            # This loss was discovered with LLM discovery
-            logratios = chosen_logps - rejected_logps
-            ref_logratios = ref_chosen_logps - ref_rejected_logps
-            logits = logratios - ref_logratios
-            logits = logits * self.beta
-            # Modulate the mixing coefficient based on the log ratio magnitudes
-            log_ratio_modulation = torch.sigmoid(logits / self.args.discopop_tau)
-            logistic_component = -F.logsigmoid(logits)
-            exp_component = torch.exp(-logits)
-            # Blend between logistic and exponential component based on log ratio modulation
-            losses = (
-                logistic_component * (1 - log_ratio_modulation)
-                + exp_component * log_ratio_modulation
-            )
-
-        elif loss_type == "sft":
-            # SFT loss is the negative log likelihood loss on chosen responses
-            # This acts as the generation loss component in MPO
-            sft_loss = model_output["nll_loss"]
-            # Create losses tensor with same shape as other losses (per-sample)
-            batch_size = chosen_logps.shape[0]
-            losses = sft_loss.expand(batch_size)
-            # For SFT, we don't have preference rewards, so use zeros
-            chosen_rewards = torch.zeros_like(chosen_logps)
-            rejected_rewards = torch.zeros_like(rejected_logps)
-
-        else:
-            raise ValueError(
-                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge', 'ipo', 'exo_pair', "
-                "'nca_pair', 'robust', 'bco_pair', 'sppo_hard', 'aot', 'aot_pair', 'discopop', 'apo_zero', "
-                "'apo_down', 'sft']"
-            )
-
-        chosen_rewards = (
-            self.beta * (chosen_logps.to(device) - ref_chosen_logps.to(device)).detach()
-        )
-        rejected_rewards = (
-            self.beta
-            * (rejected_logps.to(device) - ref_rejected_logps.to(device)).detach()
-        )
-
-        return losses, chosen_rewards, rejected_rewards
-
-    def _compute_loss_liger(
-        self, model: nn.Module, batch: dict[str, list | torch.LongTensor]
-    ) -> dict[str, torch.Tensor]:
-        unwrapped_model = self.accelerator.unwrap_model(model)
-        concatenated_batch = self.concatenated_inputs(
-            batch, padding_value=self.pad_token_id
-        )
-
-        model_kwargs = {}
-        if self.aux_loss_enabled:
-            model_kwargs["output_router_logits"] = True
-
-        # Add the pixel values and attention masks for vision models
-        if "pixel_values" in concatenated_batch:
-            model_kwargs["pixel_values"] = concatenated_batch["pixel_values"]
-        if "pixel_attention_mask" in concatenated_batch:
-            model_kwargs["pixel_attention_mask"] = concatenated_batch[
-                "pixel_attention_mask"
-            ]
-        if "image_sizes" in concatenated_batch:
-            model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
-
-        prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
-        completion_attention_mask = concatenated_batch["completion_attention_mask"]
-
-        if self.is_encoder_decoder:
-            # 1. Get encoder outputs
-            encoder_outputs = unwrapped_model.get_encoder()(
-                concatenated_batch["prompt_input_ids"],
-                attention_mask=concatenated_batch["prompt_attention_mask"],
-                return_dict=True,
-            )
-            # 2. Prepare decoder inputs
-            decoder_input_ids = shift_tokens_right(
-                concatenated_batch["completion_input_ids"],
-                unwrapped_model.config.decoder_start_token_id,
-            )
-            # 3. Get decoder outputs
-            decoder_outputs = unwrapped_model.get_decoder()(
-                input_ids=decoder_input_ids,
-                attention_mask=concatenated_batch["completion_attention_mask"],
-                encoder_hidden_states=encoder_outputs.last_hidden_state,
-                encoder_attention_mask=concatenated_batch["prompt_attention_mask"],
-                use_cache=False,
-            )
-            hidden_states = decoder_outputs.last_hidden_state
-
-            ref_hidden_states = None
-            if not self.reference_free and self.ref_model is not None:
-                unwrapped_ref_model = self.accelerator.unwrap_model(self.ref_model)
-                ref_encoder_outputs = unwrapped_ref_model.get_encoder()(
-                    concatenated_batch["prompt_input_ids"],
-                    attention_mask=concatenated_batch["prompt_attention_mask"],
-                    return_dict=True,
-                )
                 ref_decoder_outputs = unwrapped_ref_model.get_decoder()(
                     input_ids=decoder_input_ids,
                     attention_mask=concatenated_batch["completion_attention_mask"],
@@ -2240,58 +1323,67 @@ class VMCPOTrainer(BaseTrainer):
             )
             labels = masked_input_ids[:, 1:]  # Shift right for casual LM
 
-        # Get the LM head
-        lm_head = unwrapped_model.get_output_embeddings()
+    def e_step_dual_update(
+        self, advantages: torch.Tensor, update: bool = True
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Compute ψ weights via the VMPO E-step using offline advantages."""
+        if advantages.numel() == 0:
+            return advantages.new_zeros(advantages.shape), []
 
-        # Get reference model weights if needed
-        ref_weight = None
-        ref_bias = None
-        if not self.reference_free:
-            if self.ref_model is not None:
-                unwrapped_ref_model = self.accelerator.unwrap_model(self.ref_model)
-                ref_lm_head = unwrapped_ref_model.get_output_embeddings()
-            else:
-                with self.null_ref_context():
-                    ref_lm_head = unwrapped_model.get_output_embeddings()
-            ref_weight = ref_lm_head.weight
-            ref_bias = ref_lm_head.bias if hasattr(ref_lm_head, "bias") else None
+        psi = torch.zeros_like(advantages)
+        l_eta_values: list[torch.Tensor] = []
+        steps = self.args.eta_inner_steps if update else 1
+        num_items = advantages.numel()
 
-        # Compute loss using Liger kernel
-        loss_output = self.vmcpo_loss_fn(
-            lm_head.weight,
-            hidden_states,
-            labels,
-            bias=lm_head.bias if hasattr(lm_head, "bias") else None,
-            ref_input=ref_hidden_states if not self.reference_free else None,
-            ref_weight=ref_weight if not self.reference_free else None,
-            ref_bias=ref_bias if not self.reference_free else None,
-        )
-        (
-            loss,
-            (
-                chosen_logps,
-                rejected_logps,
-                chosen_logits_mean,
-                rejected_logits_mean,
-                nll_loss,
-                *aux_outputs,
-            ),
-        ) = loss_output
+        for _ in range(steps):
+            eta = F.softplus(self.eta_raw) + self.args.eta_min
+            max_adv = advantages.max()
+            weights = torch.exp((advantages - max_adv) / (eta + 1e-8))
+            psi = weights / weights.sum().clamp_min(1e-8)
 
-        output = {
-            "loss": loss,
-            "chosen_logps": chosen_logps,
-            "rejected_logps": rejected_logps,
-            "mean_chosen_logits": chosen_logits_mean,
-            "mean_rejected_logits": rejected_logits_mean,
-            "nll_loss": nll_loss,
-            "chosen_rewards": aux_outputs[0],
-            "rejected_rewards": aux_outputs[1],
-        }
-        if self.aux_loss_enabled:
-            output["aux_loss"] = outputs.aux_loss
+            if not update:
+                break
 
-        return output
+            log_mean_exp = torch.logsumexp(advantages / (eta + 1e-8), dim=0) - math.log(
+                max(num_items, 1)
+            )
+            l_eta = eta * (self.args.eps_eta + log_mean_exp)
+            self.eta_optimizer.zero_grad()
+            l_eta.backward()
+            self.eta_optimizer.step()
+            l_eta_values.append(l_eta.detach())
+
+        return psi, l_eta_values
+
+    def _m_step(
+        self, logps: torch.Tensor, ref_logps: torch.Tensor, psi: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute the VMPO M-step loss, returning total, policy, and KL components."""
+        psi_sum = psi.sum().clamp_min(1e-8)
+        if psi_sum.item() == 0:
+            policy_loss = torch.zeros((), device=logps.device, dtype=logps.dtype)
+        else:
+            policy_loss = -((psi * logps).sum() / psi_sum)
+
+        kl_terms = ref_logps - logps
+        kl_weighted = (psi * kl_terms).sum()
+        alpha = F.softplus(self.alpha_raw) + self.args.alpha_min
+        total_loss = policy_loss + alpha.detach() * kl_weighted
+        return total_loss, policy_loss.detach(), kl_weighted.detach()
+
+    def alpha_dual_update(
+        self, kl_weighted: torch.Tensor, update: bool = True
+    ) -> torch.Tensor:
+        """Update the α dual variable to track the KL trust-region target."""
+        if not update:
+            return torch.zeros((), device=self.alpha_raw.device)
+
+        self.alpha_optimizer.zero_grad()
+        alpha = F.softplus(self.alpha_raw) + self.args.alpha_min
+        l_alpha = -alpha * (kl_weighted - self.args.eps_alpha)
+        l_alpha.backward()
+        self.alpha_optimizer.step()
+        return l_alpha.detach()
 
     def concatenated_forward(
         self,
@@ -2522,7 +1614,7 @@ class VMCPOTrainer(BaseTrainer):
                     torch.exp(chosen_weights + rejected_weights), max=1
                 )
 
-        if self.args.rpo_alpha is not None or "sft" in self.loss_type:
+        if self.args.rpo_alpha is not None:
             # Only use the chosen logits for the RPO loss or SFT loss
             chosen_logits = (
                 logits[:num_examples, :-1]
@@ -2541,9 +1633,6 @@ class VMCPOTrainer(BaseTrainer):
                 torch.flatten(chosen_labels, end_dim=1),
                 ignore_index=0,
             )
-
-        if "ipo" in self.loss_type:
-            all_logps = all_logps / loss_mask.sum(-1)
 
         if self.args.ld_alpha is not None and not is_ref_model:
             # Compute response lengths based on loss_mask
@@ -2573,6 +1662,9 @@ class VMCPOTrainer(BaseTrainer):
 
         output["chosen_logps"] = all_logps[:num_examples]
         output["rejected_logps"] = all_logps[num_examples:]
+        output["trajectory_logps"] = torch.cat(
+            (output["chosen_logps"], output["rejected_logps"]), dim=0
+        )
 
         # Compute the mean logits
         if self.padding_free:
@@ -2605,61 +1697,75 @@ class VMCPOTrainer(BaseTrainer):
         batch: dict[str, list | torch.LongTensor],
         train_eval: Literal["train", "eval"] = "train",
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute the VMCPO loss and other metrics for the given batch of inputs for train or test."""
-        metrics = {}
+        """Compute VMPO-style losses and metrics for paired preference data."""
+        metrics: dict[str, float] = {}
 
-        if self.args.use_liger_kernel:
-            model_output = self._compute_loss_liger(model, batch)
-            losses = model_output["loss"]
-            chosen_rewards = model_output["chosen_rewards"]
-            rejected_rewards = model_output["rejected_rewards"]
+        updating = train_eval == "train"
+        model_output = self.concatenated_forward(model, batch)
+
+        if "ref_chosen_logps" in batch and "ref_rejected_logps" in batch:
+            ref_chosen_logps = batch["ref_chosen_logps"]
+            ref_rejected_logps = batch["ref_rejected_logps"]
         else:
-            model_output = self.concatenated_forward(model, batch)
+            ref_chosen_logps, ref_rejected_logps = self.compute_ref_log_probs(batch)
 
-            # if ref_chosen_logps and ref_rejected_logps in batch use them, otherwise use the reference model
-            if "ref_chosen_logps" in batch and "ref_rejected_logps" in batch:
-                ref_chosen_logps = batch["ref_chosen_logps"]
-                ref_rejected_logps = batch["ref_rejected_logps"]
-            else:
-                ref_chosen_logps, ref_rejected_logps = self.compute_ref_log_probs(batch)
-
-            # Initialize combined losses
-            losses = 0
-            chosen_rewards = 0
-            rejected_rewards = 0
-
-            # Compute losses for each loss type
-            for idx, loss_type in enumerate(self.loss_type):
-                # Compute individual loss using standard VMCPO loss function
-                _losses, _chosen_rewards, _rejected_rewards = self.vmcpo_loss(
-                    model_output["chosen_logps"],
-                    model_output["rejected_logps"],
-                    ref_chosen_logps,
-                    ref_rejected_logps,
-                    loss_type,
-                    model_output,
-                )
-
-                # Add weighted contributions
-                weight = self.loss_weights[idx] if self.loss_weights else 1.0
-                losses = losses + _losses * weight
-                chosen_rewards = chosen_rewards + _chosen_rewards * weight
-                rejected_rewards = rejected_rewards + _rejected_rewards * weight
-
+        chosen_logps = model_output["chosen_logps"]
+        rejected_logps = model_output["rejected_logps"]
+        chosen_rewards = self.beta * (chosen_logps - ref_chosen_logps)
+        rejected_rewards = self.beta * (rejected_logps - ref_rejected_logps)
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
-        if self.args.rpo_alpha is not None:
-            losses = (
-                losses + self.args.rpo_alpha * model_output["nll_loss"]
-            )  # RPO loss from V3 of the paper
+        advantages = torch.cat([chosen_rewards, rejected_rewards], dim=0)
+        logps = model_output["trajectory_logps"]
+        ref_logps_concat = torch.cat([ref_chosen_logps, ref_rejected_logps], dim=0)
+
+        psi, l_eta_values = self.e_step_dual_update(
+            advantages.detach(), update=updating
+        )
+        psi = psi.detach()
 
         if self.use_weighting:
-            losses = losses * model_output["policy_weights"]
+            weights = model_output["policy_weights"].repeat_interleave(2)
+            psi = psi * weights
+            psi_sum = psi.sum()
+            if psi_sum.item() <= 0:
+                psi = torch.full_like(psi, 1.0 / psi.numel())
+            else:
+                psi = psi / psi_sum
 
-        if self.aux_loss_enabled:
-            losses = losses + self.aux_loss_coef * model_output["aux_loss"]
+        loss_components = []
+        policy_components = []
+        kl_components = []
+        m_steps = max(1, self.args.m_steps)
+        for _ in range(m_steps):
+            total_loss, policy_part, kl_part = self._m_step(
+                logps, ref_logps_concat, psi
+            )
+            loss_components.append(total_loss)
+            policy_components.append(policy_part)
+            kl_components.append(kl_part)
+
+        loss = torch.stack(loss_components).mean()
+        policy_loss_value = torch.stack(policy_components).mean()
+        kl_weighted = torch.stack(kl_components).mean()
+        l_alpha = self.alpha_dual_update(kl_weighted.detach(), update=updating)
+
+        if self.args.rpo_alpha is not None:
+            loss = loss + self.args.rpo_alpha * model_output["nll_loss"]
 
         prefix = "eval_" if train_eval == "eval" else ""
+
+        if self.use_weighting:
+            # weighting already absorbed into ψ; keep metric parity by logging mean weight
+            metrics[f"{prefix}policy/weight_mean"] = (
+                self.accelerator.gather_for_metrics(model_output["policy_weights"])
+                .mean()
+                .item()
+            )
+
+        if self.aux_loss_enabled:
+            loss = loss + self.aux_loss_coef * model_output["aux_loss"]
+
         metrics[f"{prefix}rewards/chosen"] = (
             self.accelerator.gather_for_metrics(chosen_rewards).mean().item()
         )
@@ -2675,16 +1781,10 @@ class VMCPOTrainer(BaseTrainer):
             .item()
         )
         metrics[f"{prefix}logps/chosen"] = (
-            self.accelerator.gather_for_metrics(model_output["chosen_logps"])
-            .detach()
-            .mean()
-            .item()
+            self.accelerator.gather_for_metrics(chosen_logps).detach().mean().item()
         )
         metrics[f"{prefix}logps/rejected"] = (
-            self.accelerator.gather_for_metrics(model_output["rejected_logps"])
-            .detach()
-            .mean()
-            .item()
+            self.accelerator.gather_for_metrics(rejected_logps).detach().mean().item()
         )
         metrics[f"{prefix}logits/chosen"] = (
             self.accelerator.gather_for_metrics(model_output["mean_chosen_logits"])
@@ -2698,7 +1798,53 @@ class VMCPOTrainer(BaseTrainer):
             .mean()
             .item()
         )
-        if self.args.rpo_alpha is not None or "sft" in self.loss_type:
+        metrics[f"{prefix}loss/policy"] = (
+            self.accelerator.gather_for_metrics(policy_loss_value.unsqueeze(0))
+            .mean()
+            .item()
+        )
+        metrics[f"{prefix}objective/kl_ref_weighted"] = (
+            self.accelerator.gather_for_metrics(kl_weighted.unsqueeze(0)).mean().item()
+        )
+
+        eta_value = F.softplus(self.eta_raw) + self.args.eta_min
+        alpha_value = F.softplus(self.alpha_raw) + self.args.alpha_min
+        psi_state = psi
+        psi_ess = 1.0 / (psi_state.square().sum().clamp_min(1e-8))
+        psi_max = psi_state.max()
+        metrics[f"{prefix}psi/ess"] = (
+            self.accelerator.gather_for_metrics(psi_ess.unsqueeze(0)).mean().item()
+        )
+        metrics[f"{prefix}psi/max"] = (
+            self.accelerator.gather_for_metrics(psi_max.unsqueeze(0)).mean().item()
+        )
+        metrics[f"{prefix}dual/eta_value"] = (
+            self.accelerator.gather_for_metrics(eta_value.detach().unsqueeze(0))
+            .mean()
+            .item()
+        )
+        metrics[f"{prefix}dual/alpha_value"] = (
+            self.accelerator.gather_for_metrics(alpha_value.detach().unsqueeze(0))
+            .mean()
+            .item()
+        )
+        eta_grad = self.eta_raw.grad
+        alpha_grad = self.alpha_raw.grad
+        eta_grad_norm = eta_grad.norm().item() if eta_grad is not None else 0.0
+        alpha_grad_norm = alpha_grad.norm().item() if alpha_grad is not None else 0.0
+        metrics[f"{prefix}dual/eta_grad_norm"] = eta_grad_norm
+        metrics[f"{prefix}dual/alpha_grad_norm"] = alpha_grad_norm
+        metrics[f"{prefix}dual/l_eta_mean"] = (
+            torch.stack(l_eta_values).mean().item() if l_eta_values else 0.0
+        )
+        metrics[f"{prefix}dual/l_alpha"] = l_alpha.item() if updating else 0.0
+        metrics[f"{prefix}loss/total"] = (
+            self.accelerator.gather_for_metrics(loss.detach().unsqueeze(0))
+            .mean()
+            .item()
+        )
+
+        if self.args.rpo_alpha is not None:
             metrics[f"{prefix}nll_loss"] = (
                 self.accelerator.gather_for_metrics(model_output["nll_loss"])
                 .detach()
@@ -2713,7 +1859,7 @@ class VMCPOTrainer(BaseTrainer):
                 .item()
             )
 
-        return losses.mean(), metrics
+        return loss, metrics
 
     def compute_loss(
         self,

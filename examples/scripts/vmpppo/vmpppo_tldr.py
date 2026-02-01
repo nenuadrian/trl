@@ -18,14 +18,14 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from trl.experimental.vmpo import VMPOConfig, VMPOTrainer
+from trl.experimental.vmpppo import VMPPPOConfig, VMPPPOTrainer
 
 """
-python examples/scripts/vmpo/vmpo_tldr.py \
+python examples/scripts/vmpppo/vmpppo_tldr.py \
     --dataset_name trl-lib/tldr \
     --dataset_test_split validation \
     --learning_rate 3e-6 \
-    --output_dir pythia-1b-deduped-tldr-preference-sft-trl-style-vmpo \
+    --output_dir pythia-1b-deduped-tldr-preference-sft-trl-style-vmpppo \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 64 \
     --total_episodes 30000 \
@@ -39,10 +39,10 @@ python examples/scripts/vmpo/vmpo_tldr.py \
     --eval_steps 100
 
 accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
-    examples/scripts/vmpo/vmpo_tldr.py \
+    examples/scripts/vmpppo/vmpppo_tldr.py \
     --dataset_name trl-lib/tldr \
     --dataset_test_split validation \
-    --output_dir pythia-1b-deduped-tldr-preference-sft-trl-style-vmpo \
+    --output_dir pythia-1b-deduped-tldr-preference-sft-trl-style-vmpppo \
     --learning_rate 3e-6 \
     --per_device_train_batch_size 16 \
     --gradient_accumulation_steps 4 \
@@ -61,7 +61,7 @@ accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 if __name__ == "__main__":
-    parser = HfArgumentParser((ScriptArguments, VMPOConfig, ModelConfig))
+    parser = HfArgumentParser((ScriptArguments, VMPPPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_into_dataclasses()
     # remove output_dir if exists
     shutil.rmtree(training_args.output_dir, ignore_errors=True)
@@ -165,7 +165,7 @@ if __name__ == "__main__":
     ################
     # Training
     ################
-    trainer = VMPOTrainer(
+    trainer = VMPPPOTrainer(
         args=training_args,
         processing_class=tokenizer,
         model=policy,
