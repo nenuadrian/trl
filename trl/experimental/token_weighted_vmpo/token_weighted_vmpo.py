@@ -1208,7 +1208,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         entropy_stats: list,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
-        kl_weighted_max_tok_accum: torch.Tensor,  : track local spikes
+        kl_weighted_max_tok_accum: torch.Tensor, 
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list, list]:
         kl_vals_last_mstep: list[torch.Tensor] = []
         b_inds = np.random.permutation(self.args.local_batch_size)
