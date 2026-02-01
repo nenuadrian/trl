@@ -1576,19 +1576,6 @@ class VMCPOTrainer(BaseTrainer):
         all_logps = per_token_logps[:, 1:].sum(-1)
         output: dict[str, torch.Tensor] = {}
 
-        if self.args.rpo_alpha is not None and not is_ref_model:
-            if self.is_encoder_decoder:
-                chosen_logits = logits[:num_examples]
-                chosen_labels = labels[:num_examples]
-            else:
-                chosen_logits = logits[:num_examples, :-1]
-                chosen_labels = labels[:num_examples, :-1]
-            output["nll_loss"] = F.cross_entropy(
-                torch.flatten(chosen_logits, end_dim=1),
-                torch.flatten(chosen_labels, end_dim=1),
-                ignore_index=0,
-            )
-
         if (
             self.args.ld_alpha is not None
             and not is_ref_model
