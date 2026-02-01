@@ -839,9 +839,15 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         #########
         # trainer specifics
         #########
-        default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
-            self.args.report_to
-        )
+        from transformers.trainer_callback import DefaultFlowCallback, PrinterCallback
+
+        default_callbacks = [
+            DefaultFlowCallback(),
+            PrinterCallback(),
+        ]
+
+        default_callbacks += get_reporting_integration_callbacks(self.args.report_to)
+
         self.callbacks = (
             default_callbacks if callbacks is None else default_callbacks + callbacks
         )
