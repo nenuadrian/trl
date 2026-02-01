@@ -162,6 +162,18 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             "Set to None to disable."
         },
     )
+    psi_ess_min_tokens: int = field(
+        default=256,
+        metadata={
+            "help": "Enable entropy regularization when token-level ψ ESS drops below this threshold (in tokens)."
+        },
+    )
+    entropy_beta: float = field(
+        default=0.0,
+        metadata={
+            "help": "Entropy regularization coefficient β (only applied when ψ ESS < psi_ess_min_tokens). Set 0 to disable."
+        },
+    )
 
     # Parameters whose default values are overridden from TrainingArguments
     logging_steps: float = field(
@@ -372,6 +384,10 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             raise ValueError("`eos_bonus` must be non-negative.")
         if self.psi_topk_ratio is not None and not (0.0 < self.psi_topk_ratio <= 1.0):
             raise ValueError("`psi_topk_ratio` must be in (0, 1] or None.")
+        if self.psi_ess_min_tokens < 1:
+            raise ValueError("`psi_ess_min_tokens` must be >= 1.")
+        if self.entropy_beta < 0:
+            raise ValueError("`entropy_beta` must be >= 0.")
         super().__post_init__()
 
 
@@ -1190,6 +1206,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         self,
         *,
         psi_global: torch.Tensor,
+        apply_entropy_reg: bool,
         queries: torch.Tensor,
         responses: torch.Tensor,
         padding_mask_p1: torch.Tensor,
@@ -1209,8 +1226,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             mb_query = queries[mb_inds]
             mb_response = responses[mb_inds]
             mb_query_response = torch.cat((mb_query, mb_response), 1)
-            psi_mb = psi_global[mb_inds]               # token-level ψ in [mb, T]
-            mask_valid_mb = ~padding_mask_p1[mb_inds]  # [mb, T]
+            psi_mb = psi_global[mb_inds]
+            mask_valid_mb = ~padding_mask_p1[mb_inds]
 
             policy_outputs = forward(
                 self.model.policy,
@@ -1220,7 +1237,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             new_logits = policy_outputs.logits[:, context_length - 1 : -1]
             new_logprobs = selective_log_softmax(new_logits, mb_response)
 
-            # token-level MAP objective: E_ψ[-log π]
             psi_mass_mb = psi_mb.sum()
             if psi_mass_mb > 0:
                 policy_loss = -((psi_mb * new_logprobs).sum() / (psi_mass_mb + 1e-8))
@@ -1251,7 +1267,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 value_loss = torch.zeros((), device=self.accelerator.device)
 
             # expected KL under token-level ψ (use rollout logprobs as "old")
-            kl_terms_token = (logprobs[mb_inds] - new_logprobs) * mask_valid_mb  # [mb, T]
+            kl_terms_token = (logprobs[mb_inds] - new_logprobs) * mask_valid_mb
             kl_num_mb = (psi_mb * kl_terms_token).sum()
             kl_den_mb = psi_mass_mb.clamp_min(1e-8)
             kl_mean_mb = kl_num_mb / kl_den_mb
@@ -1262,6 +1278,16 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 + alpha.detach() * kl_mean_mb
                 + (self.args.vf_coef / self.args.m_steps) * value_loss
             )
+
+            # Conditional entropy regularization (only if ESS is low for this rollout)
+            if apply_entropy_reg and self.args.entropy_beta > 0.0:
+                logp_all = F.log_softmax(new_logits, dim=-1)
+                p_all = logp_all.exp()
+                token_entropy = -(p_all * logp_all).sum(dim=-1)  # [mb, T]
+                if mask_valid_mb.any():
+                    entropy = token_entropy[mask_valid_mb].mean()
+                    total_loss = total_loss + (-self.args.entropy_beta * entropy)
+
             self.accelerator.backward(total_loss)
             self.optimizer.step()
             self.optimizer.zero_grad()
@@ -1403,6 +1429,19 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             )
             psi_global = psi_global.detach()
 
+            # rollout-level ESS over tokens (consistent trigger across all minibatches this rollout)
+            with torch.no_grad():
+                psi_tok = psi_global[psi_global > 0]
+                psi_ess_tok = (
+                    1.0 / (psi_tok.pow(2).sum().clamp_min(1e-8))
+                    if psi_tok.numel() > 0
+                    else torch.zeros((), device=device)
+                )
+                apply_entropy_reg = bool(
+                    (self.args.entropy_beta > 0.0)
+                    and (psi_ess_tok.item() < float(self.args.psi_ess_min_tokens))
+                )
+
             kl_weighted_num_accum = torch.zeros((), device=device)
             kl_weighted_den_accum = torch.zeros((), device=device)
             pg_losses, vf_losses, kl_vals_last_mstep = [], [], []
@@ -1416,6 +1455,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     kl_vals_last_mstep,
                 ) = self._m_step(
                     psi_global=psi_global,
+                    apply_entropy_reg=apply_entropy_reg,
                     queries=queries,
                     responses=responses,
                     padding_mask_p1=padding_mask_p1,
@@ -1519,7 +1559,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         if n_tok == 0:
             return psi_global, l_eta_full_values
 
-        # Optional: top-k truncation of support (V-MPO-style)
         if self.args.psi_topk_ratio is None or self.args.psi_topk_ratio >= 1.0:
             mask_topk = torch.ones_like(A_valid, dtype=torch.bool)
         else:
@@ -1665,6 +1704,13 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             # Optional sanity checks for truncation (won't error if disabled)
             metrics["psi/topk_ratio"] = float(self.args.psi_topk_ratio or 1.0)
             metrics["psi/num_tok_nonzero"] = float((psi_global > 0).sum().item())
+
+            metrics["entropy/beta"] = float(self.args.entropy_beta)
+            metrics["entropy/ess_min_tokens"] = float(self.args.psi_ess_min_tokens)
+            metrics["entropy/active"] = float(
+                (self.args.entropy_beta > 0.0)
+                and (psi_ess_tok.item() < float(self.args.psi_ess_min_tokens))
+            )
 
         return metrics
 
