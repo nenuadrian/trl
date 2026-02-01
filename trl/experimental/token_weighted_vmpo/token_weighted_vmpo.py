@@ -1521,6 +1521,28 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             )
             self.state.global_step += 1
             self.state.epoch = self.state.episode / self.train_dataset_len
+            self.log(
+                self.generate_metrics(
+                    kl_weighted_num_accum,
+                    kl_weighted_den_accum,
+                    kl_weighted_max_tok_accum,  # NEW
+                    reward_seq,
+                    reward_tok,
+                    psi_global,
+                    l_eta_full_values,
+                    scores,
+                    approxkl_stats,
+                    pg_loss_stats,
+                    vf_loss_stats,
+                    vf_clipfrac_stats,
+                    contain_eos_token_raw,
+                    contain_eos_token_post,
+                    rollout_token_logprobs_mean,
+                    rollout_entropy_mean,
+                    policy_entropy_mean,
+                    device,
+                )
+            )
 
             # Let callbacks do their job
             self.control = self.callback_handler.on_step_end(
