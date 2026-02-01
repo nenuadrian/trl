@@ -71,7 +71,6 @@ from ..models import create_reference_model, prepare_deepspeed
 from ..models.utils import peft_module_casting_to_bf16, prepare_fsdp
 from .base_trainer import BaseTrainer
 from .callbacks import SyncRefModelCallback
-from .vmcpo_config import VMCPOConfig, FDivergenceConstants, FDivergenceType
 from .utils import (
     RunningMoments,
     cap_exp,
