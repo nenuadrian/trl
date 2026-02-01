@@ -36,8 +36,7 @@ _import_structure = {
     "gkd_trainer": ["GKDTrainer"],  # deprecated import
     "grpo_config": ["GRPOConfig"],
     "grpo_trainer": ["GRPOTrainer"],
-    "vmcpo_config": ["VMCPOConfig"],
-    "vmcpo_trainer": ["VMCPOTrainer"],
+    "vmcpo_trainer": ["VMCPOTrainer", "VMCPOConfig"],
     "judges": [
         "AllTrueJudge",  # deprecated import
         "BaseBinaryJudge",  # deprecated import
