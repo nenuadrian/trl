@@ -1421,6 +1421,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         assert eos_id != processing_class.pad_token_id
 
         accelerator.print("===training policy===")
+        accelerator.print(
+            f"[DEBUG] Training config: eos_id={eos_id}, pad_id={processing_class.pad_token_id}, stop_token_id={self.stop_token_id}"
+        )
+
         stats_shape = (
             self.args.num_mini_batches,
             self.args.gradient_accumulation_steps,
@@ -1956,6 +1960,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             gather_deepspeed3_params=self.args.ds3_gather_for_generation,
             generation_kwargs=generation_kwargs,
         ) as unwrapped_model:
+            self.accelerator.print(
+                f"[DEBUG] Eval generation: eos_id={eos_id}, pad_id={processing_class.pad_token_id}"
+            )
+
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
                 with torch.no_grad():
