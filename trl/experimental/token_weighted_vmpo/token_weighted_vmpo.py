@@ -35,6 +35,7 @@ from transformers.trainer_callback import (
     CallbackHandler,
     ExportableState,
     PrinterCallback,
+    ProgressCallback,
 )
 from transformers import TrainingArguments
 from transformers.utils import ModelOutput, is_peft_available, is_rich_available
@@ -110,6 +111,31 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             "help": "Entropy regularization coefficient β (only applied when ψ ESS < psi_ess_min_tokens). Set 0 to disable."
         },
     )
+    reward_spread_k: int = field(
+        default=1,
+        metadata={
+            "help": "Diffuse the terminal scalar reward over the last K response tokens (K=1 keeps old behavior)."
+        },
+    )
+    eta_lr_mult: float = field(
+        default=0.1,
+        metadata={
+            "help": "Learning-rate multiplier for η dual optimizer relative to policy learning rate."
+        },
+    )
+    alpha_lr_mult: float = field(
+        default=1.0,
+        metadata={
+            "help": "Learning-rate multiplier for α dual optimizer relative to policy learning rate."
+        },
+    )
+    advantage_clip: float | None = field(
+        default=10.0,
+        metadata={
+            "help": "Clamp centered advantages to [-advantage_clip, advantage_clip] before exponentiation in ψ/η "
+            "updates (numerical hygiene). Set to None to disable."
+        },
+    )
 
     # Parameters whose default values are overridden from TrainingArguments
     logging_steps: float = field(
@@ -157,7 +183,7 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         metadata={"help": "Number of minibatches to split a batch into."},
     )
     m_steps: int = field(
-        default=4,
+        default=2,
         metadata={
             "help": "Number of policy/value gradient steps (M-step iterations) per rollout with ψ fixed."
         },
@@ -271,10 +297,6 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             "help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."
         },
     )
-    whiten_rewards: bool = field(
-        default=False,
-        metadata={"help": "Whether to whiten the rewards."},
-    )
     kl_estimator: Literal["k1", "k3"] = field(
         default="k1",
         metadata={
@@ -324,6 +346,14 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             raise ValueError("`psi_ess_min_tokens` must be >= 1.")
         if self.entropy_beta < 0:
             raise ValueError("`entropy_beta` must be >= 0.")
+        if self.reward_spread_k < 1:
+            raise ValueError("`reward_spread_k` must be >= 1.")
+        if self.eta_lr_mult < 0:
+            raise ValueError("`eta_lr_mult` must be >= 0.")
+        if self.alpha_lr_mult < 0:
+            raise ValueError("`alpha_lr_mult` must be >= 0.")
+        if self.advantage_clip is not None and self.advantage_clip <= 0:
+            raise ValueError("`advantage_clip` must be > 0 or None.")
         super().__post_init__()
 
 
@@ -350,7 +380,7 @@ def generate(
     lm_backbone: torch.nn.Module,
     queries: torch.Tensor,
     pad_token_id: int,
-    generation_config: GenerationConfig,
+    generation_kwargs: dict,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Generates sequences from the language model backbone in a way that does not affect padding tokens.
@@ -362,8 +392,8 @@ def generate(
             The tensor containing the input queries.
         pad_token_id (`int`):
             The token ID representing the pad token.
-        generation_config ([`~transformers.GenerationConfig`]):
-            The configuration for the generation process.
+        generation_kwargs (`dict`):
+            The generation parameters.
 
     Returns:
         tuple:
@@ -375,14 +405,15 @@ def generate(
     context_length = queries.shape[1]
     attention_mask = queries != pad_token_id
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+
+    # NOTE: Pass generation parameters explicitly (no generation_config) to avoid
+    # "Please pass either a generation_config object OR all generation parameters explicitly, but not both."
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # not needed: already adjusted in generations
-        # https://github.com/huggingface/transformers/blob/ac33aeeeee2a7a89b89c93c2962e6feb90daef0a/src/transformers/models/gpt2/modeling_gpt2.py#L1227-L1250
-        generation_config=generation_config,
         return_dict_in_generate=True,
         output_scores=True,
+        **generation_kwargs,
     )
     logits = torch.stack(output.scores, 1)
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
@@ -394,7 +425,7 @@ def batch_generation(
     queries: torch.Tensor,
     local_rollout_forward_batch_size: int,
     pad_token_id: int,
-    generation_config: GenerationConfig,
+    generation_kwargs: dict,
 ):
     """Generate responses in micro-batches to control memory, then pad and reshape to the original batch size."""
     query_responses = []
@@ -407,7 +438,7 @@ def batch_generation(
             model,
             query,
             pad_token_id,
-            generation_config,
+            generation_kwargs,
         )
         query_responses.append(query_response)
         logitss.append(logits)
@@ -745,10 +776,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             args.num_mini_batches,
             "`local_batch_size` must be a multiple of `num_mini_batches`",
         )
-        if args.whiten_rewards:
-            assert (
-                args.local_mini_batch_size >= 8
-            ), f"Per-rank minibatch size {args.local_mini_batch_size} is insufficient for whitening"
         # `per_rank_rollout_batch_size` is our `args.local_batch_size`
         # `per_rank_minibatch_size` is our `args.local_mini_batch_size`
         args.num_total_batches = math.ceil(
@@ -794,8 +821,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         self.optimizer.param_groups = [
             g for g in self.optimizer.param_groups if len(g["params"]) > 0
         ]
-        eta_lr = self.args.learning_rate
-        alpha_lr = self.args.learning_rate
+        policy_lr = float(self.args.learning_rate)
+        eta_lr = policy_lr * float(self.args.eta_lr_mult)
+        alpha_lr = policy_lr * float(self.args.alpha_lr_mult)
+
         self.eta_optimizer = torch.optim.Adam(
             [self.model.eta_raw],
             lr=eta_lr,
@@ -950,7 +979,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     queries,
                     self.args.local_rollout_forward_batch_size,
                     processing_class.pad_token_id,
-                    generation_config,
+                    generation_kwargs,
                 )
 
             for i in range(
@@ -1061,7 +1090,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             valid_token_mask = ~padding_mask
 
             # Mean token logprob under the rollout policy (sampling proxy; NOT optimization entropy)
-            rollout_token_logprobs_mean = logprobs.sum() / (valid_token_mask.sum() + 1e-8)
+            rollout_token_logprobs_mean = logprobs.sum() / (
+                valid_token_mask.sum() + 1e-8
+            )
 
             # True token entropy of the rollout distribution from rollout logits (still sampling-time)
             with torch.no_grad():
@@ -1103,25 +1134,28 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 sequence_lengths_p1,
                 sequence_lengths,
             )
-            rewards[actual_start, actual_end] += scores
-            if self.args.eos_bonus > 0:
-                eos_positions = first_true_indices(postprocessed_responses == eos_id)
-                has_eos = contain_eos_token_post
-                batch_idx = torch.arange(rewards.size(0), device=rewards.device)[
-                    has_eos
-                ]
-                rewards[batch_idx, eos_positions[has_eos]] += self.args.eos_bonus
+
+            # Diffuse terminal reward over the final K tokens (avoids a single-token advantage spike)
+            K = int(self.args.reward_spread_k)
+            if K == 1:
+                rewards[actual_start, actual_end] += scores
+            else:
+                # spread over as many tail tokens as exist: k_eff = min(K, actual_end+1)
+                k_eff = torch.minimum(
+                    torch.full_like(actual_end, K),
+                    actual_end + 1,
+                ).to(dtype=scores.dtype)
+                score_per = scores / k_eff
+                for offset in range(K):
+                    m = actual_end >= offset
+                    if m.any():
+                        idx = actual_end[m] - offset
+                        rewards[actual_start[m], idx] += score_per[m]
+
             # logging masks/summaries
             reward_valid_mask = ~padding_mask_p1
             reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
             reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
-
-            # 5. whiten rewards
-            if self.args.whiten_rewards:
-                rewards = masked_whiten(
-                    rewards, mask=~padding_mask_p1, shift_mean=False
-                )
-                rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
 
             # 6. compute advantages and returns
             lastgaelam = 0
@@ -1165,7 +1199,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         queries: torch.Tensor,
         responses: torch.Tensor,
         padding_mask_p1: torch.Tensor,
-        logprobs: torch.Tensor,
+        old_logprobs_for_kl: torch.Tensor,  # recomputed per M-step pass
         values: torch.Tensor,
         returns: torch.Tensor,
         context_length: int,
@@ -1174,7 +1208,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         entropy_stats: list,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, list, list, list, list]:
+        kl_weighted_max_tok_accum: torch.Tensor,  # NEW: track local spikes
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list, list]:
         kl_vals_last_mstep: list[torch.Tensor] = []
         b_inds = np.random.permutation(self.args.local_batch_size)
         for start in range(0, len(b_inds), self.args.local_mini_batch_size):
@@ -1226,19 +1261,33 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     -self.args.value_clip, self.args.value_clip
                 )
                 value_target = value_old_mb + delta
-            if value_mask.any():
-                value_loss = F.mse_loss(
-                    value_pred[value_mask],
-                    value_target[value_mask],
-                )
+
+            # ψ-weighted critic loss (EM-consistent): E_ψ[(V - target)^2]
+            weight = psi_mb * value_mask.to(dtype=psi_mb.dtype)
+            denom = weight.sum().clamp_min(1e-8)
+            if denom > 0:
+                value_loss = (((value_pred - value_target) ** 2) * weight).sum() / denom
             else:
                 value_loss = torch.zeros((), device=self.accelerator.device)
 
-            # expected KL under token-level ψ (use rollout logprobs as "old")
-            kl_terms_token = (logprobs[mb_inds] - new_logprobs) * mask_valid_mb
+            # expected KL under token-level ψ (use per-pass old_logprobs, not rollout logprobs)
+            kl_terms_token = (
+                old_logprobs_for_kl[mb_inds] - new_logprobs
+            ) * mask_valid_mb
             kl_num_mb = (psi_mb * kl_terms_token).sum()
             kl_den_mb = psi_mass_mb.clamp_min(1e-8)
             kl_mean_mb = kl_num_mb / kl_den_mb
+
+            # NEW: max ψ-weighted token KL (watch for local KL spikes)
+            with torch.no_grad():
+                kl_weighted_tok = (psi_mb * kl_terms_token).masked_fill(
+                    ~mask_valid_mb, float("-inf")
+                )
+                kl_weighted_max_mb = (
+                    kl_weighted_tok.max()
+                    if mask_valid_mb.any()
+                    else torch.tensor(float("-inf"), device=self.accelerator.device)
+                )
 
             alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
             total_loss = (
@@ -1251,7 +1300,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             if apply_entropy_reg and self.args.entropy_beta > 0.0:
                 # reuse the already-computed token_entropy/logp_all/p_all shape logic
                 if mask_valid_mb.any():
-                    total_loss = total_loss + (-self.args.entropy_beta * token_entropy[mask_valid_mb].mean())
+                    total_loss = total_loss + (
+                        -self.args.entropy_beta * token_entropy[mask_valid_mb].mean()
+                    )
 
             self.accelerator.backward(total_loss)
             self.optimizer.step()
@@ -1259,6 +1310,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             kl_weighted_num_accum += kl_num_mb.detach()
             kl_weighted_den_accum += kl_den_mb.detach()
+            kl_weighted_max_tok_accum = torch.maximum(
+                kl_weighted_max_tok_accum, kl_weighted_max_mb.detach()
+            )
             pg_losses.append(policy_loss.detach())
             vf_losses.append(value_loss.detach())
             kl_vals_last_mstep.append(kl_mean_mb.detach())
@@ -1274,6 +1328,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         return (
             kl_weighted_num_accum,
             kl_weighted_den_accum,
+            kl_weighted_max_tok_accum,
             pg_losses,
             vf_losses,
             kl_vals_last_mstep,
@@ -1301,14 +1356,13 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             "top_p": 1.0,
             "do_sample": True,
             "early_stopping": True,
+            "eos_token_id": self.stop_token_id,
+            "pad_token_id": processing_class.pad_token_id,
         }
-        generation_config = GenerationConfig(**generation_kwargs)
         eos_id = self.stop_token_id
-        generation_config.eos_token_id = eos_id
-        generation_config.pad_token_id = processing_class.pad_token_id
-        assert generation_config.eos_token_id is not None
-        assert generation_config.pad_token_id is not None
-        assert generation_config.eos_token_id != generation_config.pad_token_id
+        assert eos_id is not None
+        assert processing_class.pad_token_id is not None
+        assert eos_id != processing_class.pad_token_id
 
         accelerator.print("===training policy===")
         stats_shape = (
@@ -1384,7 +1438,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 ref_policy,
                 reward_model,
                 processing_class,
-                generation_config,
+                None,  # CHANGED: no GenerationConfig needed
                 eos_id,
                 device,
             )
@@ -1411,12 +1465,34 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             kl_weighted_num_accum = torch.zeros((), device=device)
             kl_weighted_den_accum = torch.zeros((), device=device)
+            kl_weighted_max_tok_accum = torch.tensor(float("-inf"), device=device)
             pg_losses, vf_losses, kl_vals_last_mstep, entropy_stats = [], [], [], []
 
             for _ in range(self.args.m_steps):
+                # Recompute "old" logprobs under the current policy snapshot (before this pass's updates)
+                with torch.no_grad():
+                    query_responses = torch.cat((queries, responses), 1)
+                    old_logprobs_chunks = []
+                    bs = query_responses.shape[0]
+                    step_bs = int(self.args.local_rollout_forward_batch_size)
+                    for i in range(0, bs, step_bs):
+                        qr = query_responses[i : i + step_bs]
+                        out = forward(
+                            self.model.policy,
+                            qr,
+                            self.processing_class.pad_token_id,
+                        )
+                        old_logits = out.logits[:, context_length - 1 : -1]
+                        old_lp = selective_log_softmax(
+                            old_logits, responses[i : i + step_bs]
+                        )
+                        old_logprobs_chunks.append(old_lp)
+                    old_logprobs_for_kl = torch.cat(old_logprobs_chunks, dim=0)
+
                 (
                     kl_weighted_num_accum,
                     kl_weighted_den_accum,
+                    kl_weighted_max_tok_accum,
                     pg_losses,
                     vf_losses,
                     kl_vals_last_mstep,
@@ -1427,7 +1503,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     queries=queries,
                     responses=responses,
                     padding_mask_p1=padding_mask_p1,
-                    logprobs=logprobs,
+                    old_logprobs_for_kl=old_logprobs_for_kl,
                     values=values,
                     returns=returns,
                     context_length=context_length,
@@ -1436,6 +1512,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     entropy_stats=entropy_stats,
                     kl_weighted_num_accum=kl_weighted_num_accum,
                     kl_weighted_den_accum=kl_weighted_den_accum,
+                    kl_weighted_max_tok_accum=kl_weighted_max_tok_accum,
                 )
             policy_entropy_mean = (
                 torch.stack(entropy_stats).mean()
@@ -1443,10 +1520,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 else torch.zeros((), device=device)
             )
 
-            # HF trainer specifics
-            self.control = self.callback_handler.on_train_end(
-                self.args, self.state, self.control
-            )
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None)
                 self.control = self.callback_handler.on_save(
@@ -1490,14 +1563,20 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
     ) -> tuple[torch.Tensor, list]:
         # token-level ψ_{i,t} ∝ exp(A_{i,t} / η), only over valid tokens, with Σ ψ = 1
         mask_valid = ~padding_mask_p1  # [B, T]
-        A = raw_advantages             # [B, T]
+        A = raw_advantages  # [B, T]
         psi_global = torch.zeros_like(A)
         l_eta_full_values: list[torch.Tensor] = []
 
-        A_valid = A[mask_valid]        # [N_tok]
+        # Explicit (b,t) indices for valid tokens to make scatter-back robust to refactors
+        valid_idx = mask_valid.nonzero(as_tuple=False)  # [N_tok, 2]
+
+        A_valid = A[mask_valid]  # [N_tok]
         n_tok = A_valid.numel()
         if n_tok == 0:
             return psi_global, l_eta_full_values
+
+        # Center advantages over valid tokens (reduces sensitivity to reward scale/offset drift)
+        A_valid = A_valid - A_valid.mean()
 
         if self.args.psi_topk_ratio is None or self.args.psi_topk_ratio >= 1.0:
             mask_topk = torch.ones_like(A_valid, dtype=torch.bool)
@@ -1511,15 +1590,24 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         if n_sel == 0:
             return psi_global, l_eta_full_values
 
-        # Dual optimization over η (token-level log-mean-exp, restricted to selected support)
+        # Compensate eps_eta for top-k truncation to keep η behavior consistent as n_sel changes
+        effective_eps_eta = self.args.eps_eta + math.log(n_tok / n_sel)
+
+        # Helper: clamp only for exponentiation/log-mean-exp stability (do NOT affect top-k selection)
+        def _clip_for_exp(x: torch.Tensor) -> torch.Tensor:
+            clip = self.args.advantage_clip
+            return x.clamp(min=-clip, max=clip) if clip is not None else x
+
         for _ in range(self.args.eta_inner_steps):
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-            A_max = A_sel.max()
-            weights = torch.exp((A_sel - A_max) / (eta + 1e-8))
+
+            A_sel_exp = _clip_for_exp(A_sel)
+            A_max = A_sel_exp.max()
+            weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
             Z = weights.sum().clamp_min(1e-8)
 
             log_mean_exp = torch.log(Z) + (A_max / (eta + 1e-8)) - math.log(n_sel)
-            l_eta = eta * (self.args.eps_eta + log_mean_exp)
+            l_eta = eta * (effective_eps_eta + log_mean_exp)
 
             self.eta_optimizer.zero_grad()
             l_eta.backward()
@@ -1529,14 +1617,16 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         # Construct ψ with final η (scatter back into [B, T])
         with torch.no_grad():
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-            A_max = A_sel.max()
-            weights = torch.exp((A_sel - A_max) / (eta + 1e-8))
+
+            A_sel_exp = _clip_for_exp(A_sel)
+            A_max = A_sel_exp.max()
+            weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
             Z = weights.sum().clamp_min(1e-8)
             psi_sel = weights / Z  # sums to 1 over selected tokens
 
             psi_flat = torch.zeros_like(A_valid)
             psi_flat[mask_topk] = psi_sel
-            psi_global[mask_valid] = psi_flat
+            psi_global[valid_idx[:, 0], valid_idx[:, 1]] = psi_flat
 
         return psi_global, l_eta_full_values
 
@@ -1544,6 +1634,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         self,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
+        kl_weighted_max_tok_accum: torch.Tensor,  # NEW
         reward_seq: torch.Tensor,
         reward_tok: torch.Tensor,
         psi_global: torch.Tensor,
@@ -1562,7 +1653,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
     ) -> dict[str, float]:
         """Generate a dictionary of training metrics for logging."""
         with torch.no_grad():
-            kl_weighted_post = kl_weighted_num_accum / (kl_weighted_den_accum.clamp_min(1e-8))
+            kl_weighted_post = kl_weighted_num_accum / (
+                kl_weighted_den_accum.clamp_min(1e-8)
+            )
 
             rlhf_reward = reward_seq.mean()
             eta_value = F.softplus(self.model.eta_raw) + self.args.eta_min
@@ -1590,6 +1683,11 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             metrics = {}
             metrics["objective/kl_ref_weighted"] = (
                 self.accelerator.gather_for_metrics(kl_weighted_post).mean().item()
+            )
+            metrics["objective/kl_ref_weighted_max_tok"] = (
+                self.accelerator.gather_for_metrics(kl_weighted_max_tok_accum)
+                .mean()
+                .item()
             )
 
             # keep "psi/*" keys but make them token-level
@@ -1641,12 +1739,16 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             # rollout/sampling-time diagnostics (do not interpret as optimization entropy)
             metrics["rollout/token_logprobs_mean"] = (
-                self.accelerator.gather_for_metrics(rollout_token_logprobs_mean).mean().item()
+                self.accelerator.gather_for_metrics(rollout_token_logprobs_mean)
+                .mean()
+                .item()
             )
             metrics["rollout/entropy_tok_mean"] = (
                 self.accelerator.gather_for_metrics(rollout_entropy_mean).mean().item()
             )
-            metrics["deprecated/policy_token_logprobs_mean"] = metrics["rollout/token_logprobs_mean"]
+            metrics["deprecated/policy_token_logprobs_mean"] = metrics[
+                "rollout/token_logprobs_mean"
+            ]
 
             # optimization-time diagnostic: current policy entropy on training minibatches
             metrics["policy/entropy_tok_mean"] = (
@@ -1676,21 +1778,20 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             "top_p": 1.0,
             "do_sample": True,
             "early_stopping": True,
+            "eos_token_id": self.stop_token_id,
+            "pad_token_id": processing_class.pad_token_id,
         }
-        generation_config = GenerationConfig(**generation_kwargs)
         eos_id = self.stop_token_id
-        generation_config.eos_token_id = eos_id
-        generation_config.pad_token_id = processing_class.pad_token_id
-        assert generation_config.eos_token_id is not None
-        assert generation_config.pad_token_id is not None
-        assert generation_config.eos_token_id != generation_config.pad_token_id
+        assert eos_id is not None
+        assert processing_class.pad_token_id is not None
+        assert eos_id != processing_class.pad_token_id
 
         table = defaultdict(list)
         with unwrap_model_for_generation(
             self.model,
             self.accelerator,
             gather_deepspeed3_params=self.args.ds3_gather_for_generation,
-            generation_kwargs=generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
+            generation_kwargs=generation_kwargs,
         ) as unwrapped_model:
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
@@ -1701,7 +1802,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                         query,
                         query.shape[0],
                         processing_class.pad_token_id,
-                        generation_config,
+                        generation_kwargs,
                     )
                     response = query_response[:, context_length:]
                     postprocessed_response = response
