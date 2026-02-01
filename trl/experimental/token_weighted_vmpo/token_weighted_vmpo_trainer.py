@@ -289,10 +289,6 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             "help": "Name of the reference PEFT adapter, when using LoRA with multiple adapters."
         },
     )
-    whiten_rewards: bool = field(
-        default=False,
-        metadata={"help": "Whether to whiten the rewards."},
-    )
     kl_estimator: Literal["k1", "k3"] = field(
         default="k1",
         metadata={
@@ -769,10 +765,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             args.num_mini_batches,
             "`local_batch_size` must be a multiple of `num_mini_batches`",
         )
-        if args.whiten_rewards:
-            assert (
-                args.local_mini_batch_size >= 8
-            ), f"Per-rank minibatch size {args.local_mini_batch_size} is insufficient for whitening"
         # `per_rank_rollout_batch_size` is our `args.local_batch_size`
         # `per_rank_minibatch_size` is our `args.local_mini_batch_size`
         args.num_total_batches = math.ceil(
@@ -1153,13 +1145,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             reward_valid_mask = ~padding_mask_p1
             reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
             reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
-
-            # 5. whiten rewards
-            if self.args.whiten_rewards:
-                rewards = masked_whiten(
-                    rewards, mask=~padding_mask_p1, shift_mean=False
-                )
-                rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
 
             # 6. compute advantages and returns
             lastgaelam = 0
@@ -1557,6 +1542,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         psi_global = torch.zeros_like(A)
         l_eta_full_values: list[torch.Tensor] = []
 
+        # Explicit (b,t) indices for valid tokens to make scatter-back robust to refactors
+        valid_idx = mask_valid.nonzero(as_tuple=False)  # [N_tok, 2]
+
         A_valid = A[mask_valid]  # [N_tok]
         n_tok = A_valid.numel()
         if n_tok == 0:
@@ -1604,7 +1592,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             psi_flat = torch.zeros_like(A_valid)
             psi_flat[mask_topk] = psi_sel
-            psi_global[mask_valid] = psi_flat
+            psi_global[valid_idx[:, 0], valid_idx[:, 1]] = psi_flat
 
         return psi_global, l_eta_full_values
 
