@@ -610,38 +610,6 @@ class PolicyAndValueWrapper(nn.Module):
         return self.policy(**kwargs), logits
 
 
-def _patch_transformers_progress_callback_on_train_end() -> None:
-    """
-    Work around transformers bug/regression: ProgressCallback.on_train_end may try to close a None training_bar
-    on ranks where no tqdm bar was created.
-    """
-    from transformers.trainer_callback import ProgressCallback as _HFProgressCallback
-
-    # idempotent patching
-    if getattr(_HFProgressCallback.on_train_end, "_trl_safe_patch", False):
-        return
-
-    _orig_on_train_end = _HFProgressCallback.on_train_end
-
-    def _safe_on_train_end(self, args, state, control, **kwargs):
-        bar = getattr(self, "training_bar", None)
-        if bar is None:
-            return control
-        return _orig_on_train_end(self, args, state, control, **kwargs)
-
-    _safe_on_train_end._trl_safe_patch = True  # type: ignore[attr-defined]
-    _HFProgressCallback.on_train_end = _safe_on_train_end  # type: ignore[method-assign]
-
-
-class SafeProgressCallback(ProgressCallback):
-    """Work around transformers ProgressCallback crash when training_bar is None on some ranks."""
-    def on_train_end(self, args, state, control, **kwargs):
-        bar = getattr(self, "training_bar", None)
-        if bar is not None:
-            bar.close()
-        return control
-
-
 class TokenWeightedVMPOTrainer(BaseTrainer):
     """Trainer for TokenWeightedVMPOTrainer.
 
@@ -874,18 +842,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
             self.args.report_to
         )
-
-        # IMPORTANT: remove the (unsafe) default progress callback(s) entirely, then add our safe one.
-        default_callbacks = [
-            cb
-            for cb in default_callbacks
-            if not (isinstance(cb, type) and issubclass(cb, ProgressCallback))
-        ]
-
-        default_callbacks = default_callbacks + [
-            PrinterCallback if self.args.disable_tqdm else SafeProgressCallback
-        ]
-
         self.callbacks = (
             default_callbacks if callbacks is None else default_callbacks + callbacks
         )
@@ -896,9 +852,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             self.optimizer,
             self.lr_scheduler,
         )
-
-        # REMOVE the old self.add_callback(...) call; it can re-add the unsafe callback and resurrect the crash.
-        # self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
+        self.add_callback(PrinterCallback)
 
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
