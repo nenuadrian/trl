@@ -34,7 +34,13 @@ from transformers import (
     HfArgumentParser,
 )
 
-from trl import ModelConfig, ScriptArguments, get_kbit_device_map, get_peft_config, get_quantization_config
+from trl import (
+    ModelConfig,
+    ScriptArguments,
+    get_kbit_device_map,
+    get_peft_config,
+    get_quantization_config,
+)
 from trl.experimental.ppo import PPOConfig, PPOTrainer
 
 
@@ -89,7 +95,11 @@ if __name__ == "__main__":
     ################
     # Model & Tokenizer
     ################
-    dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
+    dtype = (
+        model_args.dtype
+        if model_args.dtype in ["auto", None]
+        else getattr(torch, model_args.dtype)
+    )
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
@@ -102,7 +112,9 @@ if __name__ == "__main__":
         model_kwargs["quantization_config"] = quantization_config
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, padding_side="left", trust_remote_code=model_args.trust_remote_code
+        model_args.model_name_or_path,
+        padding_side="left",
+        trust_remote_code=model_args.trust_remote_code,
     )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     value_model = AutoModelForSequenceClassification.from_pretrained(
@@ -118,13 +130,17 @@ if __name__ == "__main__":
         **model_kwargs,
     )
     policy = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+        training_args.sft_model_path,
+        trust_remote_code=model_args.trust_remote_code,
+        **model_kwargs,
     )
 
     peft_config = get_peft_config(model_args)
     if peft_config is None:
         ref_policy = AutoModelForCausalLM.from_pretrained(
-            training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+            training_args.sft_model_path,
+            trust_remote_code=model_args.trust_remote_code,
+            **model_kwargs,
         )
     else:
         ref_policy = None
@@ -134,7 +150,11 @@ if __name__ == "__main__":
     ################
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
     train_dataset = dataset[script_args.dataset_train_split]
-    eval_dataset = dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
+    eval_dataset = (
+        dataset[script_args.dataset_test_split]
+        if training_args.eval_strategy != "no"
+        else None
+    )
 
     def prepare_dataset(dataset, tokenizer):
         """pre-tokenize the dataset before training; only collate during training"""
@@ -156,11 +176,21 @@ if __name__ == "__main__":
         if eval_dataset is not None:
             eval_dataset = prepare_dataset(eval_dataset, tokenizer)
         # filtering
-        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+        train_dataset = train_dataset.filter(
+            lambda x: x["lengths"] <= 1024, num_proc=training_args.dataset_num_proc
+        )
         if eval_dataset is not None:
-            eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+            eval_dataset = eval_dataset.filter(
+                lambda x: x["lengths"] <= 1024, num_proc=training_args.dataset_num_proc
+            )
+        # Check if eval_dataset became empty after filtering
+        if eval_dataset is not None and len(eval_dataset) == 0:
+            print("Eval dataset is empty after filtering; disabling evaluation.")
+            eval_dataset = None
 
-    assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
+    assert (
+        train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id
+    ), "The last token should not be an EOS token"
 
     ################
     # Training
