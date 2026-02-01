@@ -1519,10 +1519,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 else torch.zeros((), device=device)
             )
 
-            # HF trainer specifics
-            self.control = self.callback_handler.on_train_end(
-                self.args, self.state, self.control
-            )
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None)
                 self.control = self.callback_handler.on_save(
