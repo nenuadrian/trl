@@ -1095,12 +1095,19 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             ref_logprobs = torch.masked_fill(
                 ref_logprobs, padding_mask, INVALID_LOGPROB
             )
+
+            # --- entropy diagnostic: mean token logprob over valid (non-pad) response tokens ---
+            valid_token_mask = ~padding_mask
+            token_logprobs_mean = logprobs.sum() / (valid_token_mask.sum() + 1e-8)
+            # --- end entropy diagnostic ---
+
             # rollout logits alignment check
             old_lp = selective_log_softmax(rollout_logits, responses)
             diff = (old_lp - logprobs).abs()
             diff = diff.masked_fill(padding_mask, 0)
             mean_diff = diff.sum() / ((~padding_mask).sum() + 1e-8)
             assert mean_diff < 1e-4, "rollout_logits misaligned with stored logprobs"
+
             sequence_lengths_p1 = sequence_lengths + 1
             padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
             values = torch.masked_fill(values, padding_mask_p1, 0)
@@ -1167,6 +1174,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             contain_eos_token_raw,
             contain_eos_token_post,
             rollout_logits,
+            token_logprobs_mean,  # new
         )
 
     def _m_step(
@@ -1362,6 +1370,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 contain_eos_token_raw,
                 contain_eos_token_post,
                 rollout_logits,
+                token_logprobs_mean,  # new
             ) = self.collect_rollouts(
                 generation_kwargs,
                 accelerator,
@@ -1440,6 +1449,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     vf_clipfrac_stats,
                     contain_eos_token_raw,
                     contain_eos_token_post,
+                    token_logprobs_mean,  # new
                     device,
                 )
             )
@@ -1531,6 +1541,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         vf_clipfrac_stats: torch.Tensor,
         contain_eos_token_raw: torch.Tensor,
         contain_eos_token_post: torch.Tensor,
+        token_logprobs_mean: torch.Tensor,
         device: torch.device,
     ) -> dict[str, float]:
         """Generate a dictionary of training metrics for logging."""
@@ -1606,6 +1617,12 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             metrics["val/num_eos_tokens"] = contain_eos_token_post.sum().item()
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
             metrics["episode"] = self.state.episode
+
+            # --- entropy-ish diagnostics (even if no entropy loss) ---
+            metrics["policy/token_logprobs_mean"] = (
+                self.accelerator.gather_for_metrics(token_logprobs_mean).mean().item()
+            )
+            # --- end entropy-ish diagnostics ---
 
         return metrics
 
