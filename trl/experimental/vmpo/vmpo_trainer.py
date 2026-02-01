@@ -886,6 +886,8 @@ class VMPOTrainer(BaseTrainer):
             ref_logprobs = []
             scores = []
             sequence_lengths = []
+            values = []
+            rollout_logits = []
             with unwrap_model_for_generation(
                 self.model,
                 self.accelerator,
@@ -911,6 +913,7 @@ class VMPOTrainer(BaseTrainer):
                 contain_eos_token_raw.append((response == eos_id).any(dim=1))
                 logits = logitss[i : i + self.args.local_rollout_forward_batch_size]
                 logprob = selective_log_softmax(logits, response)
+                rollout_logits.append(logits)
                 del logits
                 empty_cache()
 
@@ -952,6 +955,14 @@ class VMPOTrainer(BaseTrainer):
                     pad_idx - 1,
                     torch.full_like(pad_idx, postprocessed_response.shape[1] - 1),
                 )
+                unwrapped_value_model = accelerator.unwrap_model(model).value_model
+                full_value, _, _ = get_reward(
+                    unwrapped_value_model,
+                    query_response,
+                    processing_class.pad_token_id,
+                    context_length,
+                )
+                value = full_value[:, context_length - 1 : -1].squeeze(-1)
                 _, score, _ = get_reward(
                     reward_model,
                     postprocessed_query_response,
@@ -965,6 +976,7 @@ class VMPOTrainer(BaseTrainer):
                 ref_logprobs.append(ref_logprob)
                 sequence_lengths.append(sequence_length)
                 scores.append(score)
+                values.append(value)
             responses = torch.cat(responses, 0)
             postprocessed_responses = torch.cat(postprocessed_responses, 0)
             contain_eos_token_raw = torch.cat(contain_eos_token_raw, 0)
@@ -972,7 +984,9 @@ class VMPOTrainer(BaseTrainer):
             ref_logprobs = torch.cat(ref_logprobs, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
-            del (logprob, ref_logprob, score, unwrapped_model)
+            values = torch.cat(values, 0)
+            rollout_logits = torch.cat(rollout_logits, 0)
+            del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
             gc.collect()
 
             # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
@@ -998,7 +1012,7 @@ class VMPOTrainer(BaseTrainer):
             assert mean_diff < 1e-4, "rollout_logits misaligned with stored logprobs"
             sequence_lengths_p1 = sequence_lengths + 1
             padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
-            # values = torch.masked_fill(values, padding_mask_p1, 0)  # REMOVE
+            values = torch.masked_fill(values, padding_mask_p1, 0)
 
             # 4. compute rewards
             # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
@@ -1025,24 +1039,27 @@ class VMPOTrainer(BaseTrainer):
             reward_seq = rewards.masked_fill(padding_mask_p1, 0).sum(1)
             reward_tok = reward_seq.sum() / (reward_valid_mask.sum() + 1e-8)
 
-            # raw_advantages, returns = self._compute_gae(
-            #     rewards=rewards,
-            #     values=values,
-            #     padding_mask_p1=padding_mask_p1,
-            # )
-            # empty_cache()
+            raw_advantages, returns = self._compute_gae(
+                rewards=rewards,
+                values=values,
+                padding_mask_p1=padding_mask_p1,
+            )
+            empty_cache()
         return (
             padding_mask_p1,
+            raw_advantages,
             queries,
             responses,
             context_length,
             logprobs,
             scores,
+            values,
+            returns,
             reward_seq,
             reward_tok,
             contain_eos_token_raw,
             contain_eos_token_post,
-            sequence_lengths,
+            rollout_logits,
         )
 
     def _compute_gae(
@@ -1155,16 +1172,19 @@ class VMPOTrainer(BaseTrainer):
 
             (
                 padding_mask_p1,
+                raw_advantages,
                 queries,
                 responses,
                 context_length,
                 logprobs,
                 scores,
+                values,
+                returns,
                 reward_seq,
                 reward_tok,
                 contain_eos_token_raw,
                 contain_eos_token_post,
-                sequence_lengths,
+                rollout_logits,
             ) = self.collect_rollouts(
                 generation_kwargs,
                 accelerator,
