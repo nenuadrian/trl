@@ -610,6 +610,29 @@ class PolicyAndValueWrapper(nn.Module):
         return self.policy(**kwargs), logits
 
 
+def _patch_transformers_progress_callback_on_train_end() -> None:
+    """
+    Work around transformers bug/regression: ProgressCallback.on_train_end may try to close a None training_bar
+    on ranks where no tqdm bar was created.
+    """
+    from transformers.trainer_callback import ProgressCallback as _HFProgressCallback
+
+    # idempotent patching
+    if getattr(_HFProgressCallback.on_train_end, "_trl_safe_patch", False):
+        return
+
+    _orig_on_train_end = _HFProgressCallback.on_train_end
+
+    def _safe_on_train_end(self, args, state, control, **kwargs):
+        bar = getattr(self, "training_bar", None)
+        if bar is None:
+            return control
+        return _orig_on_train_end(self, args, state, control, **kwargs)
+
+    _safe_on_train_end._trl_safe_patch = True  # type: ignore[attr-defined]
+    _HFProgressCallback.on_train_end = _safe_on_train_end  # type: ignore[method-assign]
+
+
 class SafeProgressCallback(ProgressCallback):
     """Work around transformers ProgressCallback crash when training_bar is None on some ranks."""
     def on_train_end(self, args, state, control, **kwargs):
