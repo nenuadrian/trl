@@ -1519,7 +1519,13 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 if len(entropy_stats) > 0
                 else torch.zeros((), device=device)
             )
+            self.state.global_step += 1
+            self.state.epoch = self.state.episode / self.train_dataset_len
 
+            # Let callbacks do their job
+            self.control = self.callback_handler.on_step_end(
+                self.args, self.state, self.control
+            )
             if self.control.should_save:
                 self._save_checkpoint(model, trial=None)
                 self.control = self.callback_handler.on_save(
