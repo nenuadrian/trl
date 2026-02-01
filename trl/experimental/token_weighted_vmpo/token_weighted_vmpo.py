@@ -433,13 +433,11 @@ def ngram_repeat_count(tokens: torch.Tensor, n: int, pad_token_id: int) -> torch
         if seq.numel() < n:
             continue
 
-        ngrams = [
-            tuple(seq[j : j + n].tolist())
-            for j in range(seq.numel() - n + 1)
-        ]
+        ngrams = [tuple(seq[j : j + n].tolist()) for j in range(seq.numel() - n + 1)]
         counts[i] = len(ngrams) - len(set(ngrams))
 
     return counts
+
 
 @torch.no_grad()
 def batch_generation(
@@ -1077,7 +1075,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 logprobs.append(logprob)
                 ref_logprobs.append(ref_logprob)
                 sequence_lengths.append(sequence_length)
-                
+
                 rep_bigram = ngram_repeat_count(
                     postprocessed_response,
                     n=2,
@@ -1107,6 +1105,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
             empty_cache()
             gc.collect()
+
+            # Center rewards before advantage computation (critical for V-MPO ψ)
+            reward_mean_raw = scores.mean()
+            scores = scores - reward_mean_raw
 
             # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
             # Completions not passing that filter will receive a lower score.
@@ -1500,6 +1502,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             reward_mean = scores.mean()
             reward_min = scores.min()
             reward_max = scores.max()
+            reward_std = scores.std()
 
             psi_global, l_eta_full_values = self.e_step_dual_update(
                 padding_mask_p1=padding_mask_p1,
@@ -1592,6 +1595,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     reward_mean,
                     reward_min,
                     reward_max,
+                    reward_std,
+                    reward_mean_raw,
                     device,
                 )
             )
@@ -1772,6 +1777,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         reward_mean: torch.Tensor,
         reward_min: torch.Tensor,
         reward_max: torch.Tensor,
+        reward_std: torch.Tensor,
+        reward_mean_raw: torch.Tensor,
         device: torch.device,
     ) -> dict[str, float]:
         """Generate a dictionary of training metrics for logging."""
@@ -1855,6 +1862,12 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             )
             metrics["debug/reward_max"] = (
                 self.accelerator.gather_for_metrics(reward_max).mean().item()
+            )
+            metrics["debug/reward_std_centered"] = (
+                self.accelerator.gather_for_metrics(reward_std).mean().item()
+            )
+            metrics["debug/reward_mean_raw"] = (
+                self.accelerator.gather_for_metrics(reward_mean_raw).mean().item()
             )
             metrics["policy/approxkl_avg"] = (
                 self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
