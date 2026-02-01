@@ -206,6 +206,8 @@ if __name__ == "__main__":
         eval_dataset=eval_dataset,
         peft_config=peft_config,
     )
+    if eval_dataset is None:
+        trainer.eval_dataloader = None
     trainer.train()
 
     # Save and push to hub
