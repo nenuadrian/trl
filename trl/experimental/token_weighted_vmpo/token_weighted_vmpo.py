@@ -1199,7 +1199,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         queries: torch.Tensor,
         responses: torch.Tensor,
         padding_mask_p1: torch.Tensor,
-        old_logprobs_for_kl: torch.Tensor,  # recomputed per M-step pass
+        rollout_logprobs: torch.Tensor,  # frozen rollout logprobs for KL
         values: torch.Tensor,
         returns: torch.Tensor,
         context_length: int,
@@ -1208,7 +1208,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         entropy_stats: list,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
-        kl_weighted_max_tok_accum: torch.Tensor,  # NEW: track local spikes
+        kl_weighted_max_tok_accum: torch.Tensor,  # track local spikes
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list, list]:
         kl_vals_last_mstep: list[torch.Tensor] = []
         b_inds = np.random.permutation(self.args.local_batch_size)
@@ -1270,15 +1270,13 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             else:
                 value_loss = torch.zeros((), device=self.accelerator.device)
 
-            # expected KL under token-level ψ (use per-pass old_logprobs, not rollout logprobs)
-            kl_terms_token = (
-                old_logprobs_for_kl[mb_inds] - new_logprobs
-            ) * mask_valid_mb
+            # expected KL under token-level ψ: KL(rollout || new_policy) tokenwise
+            kl_terms_token = (rollout_logprobs[mb_inds] - new_logprobs) * mask_valid_mb
             kl_num_mb = (psi_mb * kl_terms_token).sum()
             kl_den_mb = psi_mass_mb.clamp_min(1e-8)
             kl_mean_mb = kl_num_mb / kl_den_mb
 
-            # NEW: max ψ-weighted token KL (watch for local KL spikes)
+            # max ψ-weighted token KL (watch for local KL spikes)
             with torch.no_grad():
                 kl_weighted_tok = (psi_mb * kl_terms_token).masked_fill(
                     ~mask_valid_mb, float("-inf")
@@ -1298,7 +1296,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             # Conditional entropy regularization (only if ESS is low for this rollout)
             if apply_entropy_reg and self.args.entropy_beta > 0.0:
-                # reuse the already-computed token_entropy/logp_all/p_all shape logic
                 if mask_valid_mb.any():
                     total_loss = total_loss + (
                         -self.args.entropy_beta * token_entropy[mask_valid_mb].mean()
@@ -1453,11 +1450,12 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             # rollout-level ESS over tokens (consistent trigger across all minibatches this rollout)
             with torch.no_grad():
                 psi_tok = psi_global[psi_global > 0]
-                psi_ess_tok = (
-                    1.0 / (psi_tok.pow(2).sum().clamp_min(1e-8))
-                    if psi_tok.numel() > 0
-                    else torch.zeros((), device=device)
-                )
+                if psi_tok.numel() > 0:
+                    psi_sum = psi_tok.sum()
+                    psi_ess_tok = psi_sum.pow(2) / psi_tok.pow(2).sum().clamp_min(1e-8)
+                else:
+                    psi_ess_tok = torch.zeros((), device=device)
+
                 apply_entropy_reg = bool(
                     (self.args.entropy_beta > 0.0)
                     and (psi_ess_tok.item() < float(self.args.psi_ess_min_tokens))
@@ -1469,26 +1467,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             pg_losses, vf_losses, kl_vals_last_mstep, entropy_stats = [], [], [], []
 
             for _ in range(self.args.m_steps):
-                # Recompute "old" logprobs under the current policy snapshot (before this pass's updates)
-                with torch.no_grad():
-                    query_responses = torch.cat((queries, responses), 1)
-                    old_logprobs_chunks = []
-                    bs = query_responses.shape[0]
-                    step_bs = int(self.args.local_rollout_forward_batch_size)
-                    for i in range(0, bs, step_bs):
-                        qr = query_responses[i : i + step_bs]
-                        out = forward(
-                            self.model.policy,
-                            qr,
-                            self.processing_class.pad_token_id,
-                        )
-                        old_logits = out.logits[:, context_length - 1 : -1]
-                        old_lp = selective_log_softmax(
-                            old_logits, responses[i : i + step_bs]
-                        )
-                        old_logprobs_chunks.append(old_lp)
-                    old_logprobs_for_kl = torch.cat(old_logprobs_chunks, dim=0)
-
                 (
                     kl_weighted_num_accum,
                     kl_weighted_den_accum,
@@ -1503,7 +1481,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     queries=queries,
                     responses=responses,
                     padding_mask_p1=padding_mask_p1,
-                    old_logprobs_for_kl=old_logprobs_for_kl,
+                    rollout_logprobs=logprobs,  # <-- frozen rollout logprobs for KL
                     values=values,
                     returns=returns,
                     context_length=context_length,
@@ -1514,6 +1492,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     kl_weighted_den_accum=kl_weighted_den_accum,
                     kl_weighted_max_tok_accum=kl_weighted_max_tok_accum,
                 )
+
             policy_entropy_mean = (
                 torch.stack(entropy_stats).mean()
                 if len(entropy_stats) > 0
@@ -1525,7 +1504,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 self.generate_metrics(
                     kl_weighted_num_accum,
                     kl_weighted_den_accum,
-                    kl_weighted_max_tok_accum,  # NEW
+                    kl_weighted_max_tok_accum,
                     reward_seq,
                     reward_tok,
                     psi_global,
@@ -1589,72 +1568,78 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         raw_advantages: torch.Tensor,
         device: torch.device,
     ) -> tuple[torch.Tensor, list]:
-        # token-level ψ_{i,t} ∝ exp(A_{i,t} / η), only over valid tokens, with Σ ψ = 1
+        # token-level ψ_{i,t} ∝ exp(A_{i,t} / η), normalized per sequence: Σ_t ψ_{i,t} = 1
         mask_valid = ~padding_mask_p1  # [B, T]
         A = raw_advantages  # [B, T]
         psi_global = torch.zeros_like(A)
         l_eta_full_values: list[torch.Tensor] = []
 
-        # Explicit (b,t) indices for valid tokens to make scatter-back robust to refactors
-        valid_idx = mask_valid.nonzero(as_tuple=False)  # [N_tok, 2]
-
-        A_valid = A[mask_valid]  # [N_tok]
-        n_tok = A_valid.numel()
-        if n_tok == 0:
+        B, T = A.shape
+        n_valid = mask_valid.sum(dim=1)  # [B]
+        has_valid = n_valid > 0
+        if not bool(has_valid.any()):
             return psi_global, l_eta_full_values
 
-        # Center advantages over valid tokens (reduces sensitivity to reward scale/offset drift)
-        A_valid = A_valid - A_valid.mean()
+        # Center advantages per sequence over valid tokens
+        mask_f = mask_valid.to(dtype=A.dtype)
+        denom = n_valid.to(dtype=A.dtype).clamp_min(1.0).unsqueeze(1)  # [B,1]
+        A_mean = (A * mask_f).sum(dim=1, keepdim=True) / denom
+        A_centered = A - A_mean
 
+        # Approximate per-row top-k truncation (fixed k based on T; invalid tokens masked to -inf)
         if self.args.psi_topk_ratio is None or self.args.psi_topk_ratio >= 1.0:
-            mask_topk = torch.ones_like(A_valid, dtype=torch.bool)
+            mask_topk = mask_valid
         else:
-            k = max(1, int(self.args.psi_topk_ratio * n_tok))
-            threshold = torch.topk(A_valid, k).values[-1]
-            mask_topk = A_valid >= threshold
+            k = max(1, int(self.args.psi_topk_ratio * T))
+            A_masked = A_centered.masked_fill(~mask_valid, float("-inf"))
+            thresh = torch.topk(A_masked, k, dim=1).values[:, -1].unsqueeze(1)  # [B,1]
+            mask_topk = mask_valid & (A_masked >= thresh)
 
-        A_sel = A_valid[mask_topk]
-        n_sel = A_sel.numel()
-        if n_sel == 0:
+        n_sel = mask_topk.sum(dim=1)  # [B]
+        has_sel = n_sel > 0
+        if not bool(has_sel.any()):
             return psi_global, l_eta_full_values
 
-        # Compensate eps_eta for top-k truncation to keep η behavior consistent as n_sel changes
-        effective_eps_eta = self.args.eps_eta + math.log(n_tok / n_sel)
-
-        # Helper: clamp only for exponentiation/log-mean-exp stability (do NOT affect top-k selection)
+        # Helper: clamp only for exponentiation/log-mean-exp stability
         def _clip_for_exp(x: torch.Tensor) -> torch.Tensor:
             clip = self.args.advantage_clip
             return x.clamp(min=-clip, max=clip) if clip is not None else x
 
+        n_valid_f = n_valid.to(dtype=A.dtype)
+        n_sel_f = n_sel.to(dtype=A.dtype).clamp_min(1.0)
+        eps_eta_per_seq = self.args.eps_eta + torch.log(
+            n_valid_f.clamp_min(1.0) / n_sel_f
+        )
+
         for _ in range(self.args.eta_inner_steps):
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
 
-            A_sel_exp = _clip_for_exp(A_sel)
-            A_max = A_sel_exp.max()
-            weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
-            Z = weights.sum().clamp_min(1e-8)
+            A_exp = _clip_for_exp(A_centered)
+            A_exp_masked = A_exp.masked_fill(~mask_topk, float("-inf"))
+            A_max = A_exp_masked.max(dim=1).values  # [B]
+            # exp((-inf)) -> 0 after masking; keep explicit mask for safety
+            weights = torch.exp((A_exp_masked - A_max.unsqueeze(1)) / (eta + 1e-8))
+            weights = weights.masked_fill(~mask_topk, 0.0)
+            Z = weights.sum(dim=1).clamp_min(1e-8)  # [B]
 
-            log_mean_exp = torch.log(Z) + (A_max / (eta + 1e-8)) - math.log(n_sel)
-            l_eta = eta * (effective_eps_eta + log_mean_exp)
+            log_mean_exp = torch.log(Z) + (A_max / (eta + 1e-8)) - torch.log(n_sel_f)
+            l_eta = eta * (eps_eta_per_seq + log_mean_exp)[has_sel].mean()
 
             self.eta_optimizer.zero_grad()
             l_eta.backward()
             self.eta_optimizer.step()
             l_eta_full_values.append(l_eta.detach())
 
-        # Construct ψ with final η (scatter back into [B, T])
+        # Construct ψ with final η (row-normalized)
         with torch.no_grad():
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-
-            A_sel_exp = _clip_for_exp(A_sel)
-            A_max = A_sel_exp.max()
-            weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
-            Z = weights.sum().clamp_min(1e-8)
-            psi_sel = weights / Z  # sums to 1 over selected tokens
-
-            psi_flat = torch.zeros_like(A_valid)
-            psi_flat[mask_topk] = psi_sel
-            psi_global[valid_idx[:, 0], valid_idx[:, 1]] = psi_flat
+            A_exp = _clip_for_exp(A_centered)
+            A_exp_masked = A_exp.masked_fill(~mask_topk, float("-inf"))
+            A_max = A_exp_masked.max(dim=1).values
+            weights = torch.exp((A_exp_masked - A_max.unsqueeze(1)) / (eta + 1e-8))
+            weights = weights.masked_fill(~mask_topk, 0.0)
+            Z = weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+            psi_global = weights / Z
 
         return psi_global, l_eta_full_values
 
@@ -1662,7 +1647,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         self,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
-        kl_weighted_max_tok_accum: torch.Tensor,  # NEW
+        kl_weighted_max_tok_accum: torch.Tensor,
         reward_seq: torch.Tensor,
         reward_tok: torch.Tensor,
         psi_global: torch.Tensor,
@@ -1694,7 +1679,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             # token-level ψ diagnostics
             psi_tok = psi_global[psi_global > 0]
             if psi_tok.numel() > 0:
-                psi_ess_tok = 1.0 / (psi_tok.pow(2).sum().clamp_min(1e-8))
+                psi_sum = psi_tok.sum()
+                psi_ess_tok = psi_sum.pow(2) / psi_tok.pow(2).sum().clamp_min(1e-8)
                 psi_max_tok = psi_tok.max()
             else:
                 psi_ess_tok = torch.zeros((), device=device)
