@@ -128,6 +128,13 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             "help": "Learning-rate multiplier for α dual optimizer relative to policy learning rate."
         },
     )
+    advantage_clip: float | None = field(
+        default=10.0,
+        metadata={
+            "help": "Clamp centered advantages to [-advantage_clip, advantage_clip] before exponentiation in ψ/η "
+            "updates (numerical hygiene). Set to None to disable."
+        },
+    )
 
     # Parameters whose default values are overridden from TrainingArguments
     logging_steps: float = field(
@@ -175,7 +182,7 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         metadata={"help": "Number of minibatches to split a batch into."},
     )
     m_steps: int = field(
-        default=4,
+        default=2,
         metadata={
             "help": "Number of policy/value gradient steps (M-step iterations) per rollout with ψ fixed."
         },
@@ -344,6 +351,8 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             raise ValueError("`eta_lr_mult` must be >= 0.")
         if self.alpha_lr_mult < 0:
             raise ValueError("`alpha_lr_mult` must be >= 0.")
+        if self.advantage_clip is not None and self.advantage_clip <= 0:
+            raise ValueError("`advantage_clip` must be > 0 or None.")
         super().__post_init__()
 
 
@@ -1197,7 +1206,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         entropy_stats: list,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, list, list, list, list]:
+        kl_weighted_max_tok_accum: torch.Tensor,  # NEW: track local spikes
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list, list]:
         kl_vals_last_mstep: list[torch.Tensor] = []
         b_inds = np.random.permutation(self.args.local_batch_size)
         for start in range(0, len(b_inds), self.args.local_mini_batch_size):
@@ -1266,6 +1276,17 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             kl_den_mb = psi_mass_mb.clamp_min(1e-8)
             kl_mean_mb = kl_num_mb / kl_den_mb
 
+            # NEW: max ψ-weighted token KL (watch for local KL spikes)
+            with torch.no_grad():
+                kl_weighted_tok = (psi_mb * kl_terms_token).masked_fill(
+                    ~mask_valid_mb, float("-inf")
+                )
+                kl_weighted_max_mb = (
+                    kl_weighted_tok.max()
+                    if mask_valid_mb.any()
+                    else torch.tensor(float("-inf"), device=self.accelerator.device)
+                )
+
             alpha = F.softplus(self.model.alpha_raw) + self.args.alpha_min
             total_loss = (
                 policy_loss
@@ -1287,6 +1308,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             kl_weighted_num_accum += kl_num_mb.detach()
             kl_weighted_den_accum += kl_den_mb.detach()
+            kl_weighted_max_tok_accum = torch.maximum(
+                kl_weighted_max_tok_accum, kl_weighted_max_mb.detach()
+            )
             pg_losses.append(policy_loss.detach())
             vf_losses.append(value_loss.detach())
             kl_vals_last_mstep.append(kl_mean_mb.detach())
@@ -1302,6 +1326,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         return (
             kl_weighted_num_accum,
             kl_weighted_den_accum,
+            kl_weighted_max_tok_accum,
             pg_losses,
             vf_losses,
             kl_vals_last_mstep,
@@ -1439,6 +1464,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             kl_weighted_num_accum = torch.zeros((), device=device)
             kl_weighted_den_accum = torch.zeros((), device=device)
+            kl_weighted_max_tok_accum = torch.tensor(float("-inf"), device=device)
             pg_losses, vf_losses, kl_vals_last_mstep, entropy_stats = [], [], [], []
 
             for _ in range(self.args.m_steps):
@@ -1465,6 +1491,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 (
                     kl_weighted_num_accum,
                     kl_weighted_den_accum,
+                    kl_weighted_max_tok_accum,
                     pg_losses,
                     vf_losses,
                     kl_vals_last_mstep,
@@ -1484,6 +1511,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     entropy_stats=entropy_stats,
                     kl_weighted_num_accum=kl_weighted_num_accum,
                     kl_weighted_den_accum=kl_weighted_den_accum,
+                    kl_weighted_max_tok_accum=kl_weighted_max_tok_accum,
                 )
             policy_entropy_mean = (
                 torch.stack(entropy_stats).mean()
@@ -1568,10 +1596,17 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         # Compensate eps_eta for top-k truncation to keep η behavior consistent as n_sel changes
         effective_eps_eta = self.args.eps_eta + math.log(n_tok / n_sel)
 
+        # Helper: clamp only for exponentiation/log-mean-exp stability (do NOT affect top-k selection)
+        def _clip_for_exp(x: torch.Tensor) -> torch.Tensor:
+            clip = self.args.advantage_clip
+            return x.clamp(min=-clip, max=clip) if clip is not None else x
+
         for _ in range(self.args.eta_inner_steps):
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-            A_max = A_sel.max()
-            weights = torch.exp((A_sel - A_max) / (eta + 1e-8))
+
+            A_sel_exp = _clip_for_exp(A_sel)
+            A_max = A_sel_exp.max()
+            weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
             Z = weights.sum().clamp_min(1e-8)
 
             log_mean_exp = torch.log(Z) + (A_max / (eta + 1e-8)) - math.log(n_sel)
@@ -1585,8 +1620,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         # Construct ψ with final η (scatter back into [B, T])
         with torch.no_grad():
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-            A_max = A_sel.max()
-            weights = torch.exp((A_sel - A_max) / (eta + 1e-8))
+
+            A_sel_exp = _clip_for_exp(A_sel)
+            A_max = A_sel_exp.max()
+            weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
             Z = weights.sum().clamp_min(1e-8)
             psi_sel = weights / Z  # sums to 1 over selected tokens
 
@@ -1600,6 +1637,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         self,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
+        kl_weighted_max_tok_accum: torch.Tensor,  # NEW
         reward_seq: torch.Tensor,
         reward_tok: torch.Tensor,
         psi_global: torch.Tensor,
@@ -1648,6 +1686,11 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             metrics = {}
             metrics["objective/kl_ref_weighted"] = (
                 self.accelerator.gather_for_metrics(kl_weighted_post).mean().item()
+            )
+            metrics["objective/kl_ref_weighted_max_tok"] = (
+                self.accelerator.gather_for_metrics(kl_weighted_max_tok_accum)
+                .mean()
+                .item()
             )
 
             # keep "psi/*" keys but make them token-level
