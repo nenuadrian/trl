@@ -35,6 +35,7 @@ from transformers.trainer_callback import (
     CallbackHandler,
     ExportableState,
     PrinterCallback,
+    ProgressCallback,
 )
 from transformers import TrainingArguments
 from transformers.utils import ModelOutput, is_peft_available, is_rich_available
@@ -379,7 +380,7 @@ def generate(
     lm_backbone: torch.nn.Module,
     queries: torch.Tensor,
     pad_token_id: int,
-    generation_config: GenerationConfig,
+    generation_kwargs: dict,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Generates sequences from the language model backbone in a way that does not affect padding tokens.
@@ -391,8 +392,8 @@ def generate(
             The tensor containing the input queries.
         pad_token_id (`int`):
             The token ID representing the pad token.
-        generation_config ([`~transformers.GenerationConfig`]):
-            The configuration for the generation process.
+        generation_kwargs (`dict`):
+            The generation parameters.
 
     Returns:
         tuple:
@@ -404,14 +405,15 @@ def generate(
     context_length = queries.shape[1]
     attention_mask = queries != pad_token_id
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+
+    # NOTE: Pass generation parameters explicitly (no generation_config) to avoid
+    # "Please pass either a generation_config object OR all generation parameters explicitly, but not both."
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # not needed: already adjusted in generations
-        # https://github.com/huggingface/transformers/blob/ac33aeeeee2a7a89b89c93c2962e6feb90daef0a/src/transformers/models/gpt2/modeling_gpt2.py#L1227-L1250
-        generation_config=generation_config,
         return_dict_in_generate=True,
         output_scores=True,
+        **generation_kwargs,
     )
     logits = torch.stack(output.scores, 1)
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
@@ -423,7 +425,7 @@ def batch_generation(
     queries: torch.Tensor,
     local_rollout_forward_batch_size: int,
     pad_token_id: int,
-    generation_config: GenerationConfig,
+    generation_kwargs: dict,
 ):
     """Generate responses in micro-batches to control memory, then pad and reshape to the original batch size."""
     query_responses = []
@@ -436,7 +438,7 @@ def batch_generation(
             model,
             query,
             pad_token_id,
-            generation_config,
+            generation_kwargs,
         )
         query_responses.append(query_response)
         logitss.append(logits)
@@ -851,7 +853,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             self.lr_scheduler,
         )
         self.add_callback(
-            PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK
+            PrinterCallback if self.args.disable_tqdm else SafeProgressCallback
         )
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
@@ -977,7 +979,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     queries,
                     self.args.local_rollout_forward_batch_size,
                     processing_class.pad_token_id,
-                    generation_config,
+                    generation_kwargs,
                 )
 
             for i in range(
@@ -1354,14 +1356,13 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             "top_p": 1.0,
             "do_sample": True,
             "early_stopping": True,
+            "eos_token_id": self.stop_token_id,
+            "pad_token_id": processing_class.pad_token_id,
         }
-        generation_config = GenerationConfig(**generation_kwargs)
         eos_id = self.stop_token_id
-        generation_config.eos_token_id = eos_id
-        generation_config.pad_token_id = processing_class.pad_token_id
-        assert generation_config.eos_token_id is not None
-        assert generation_config.pad_token_id is not None
-        assert generation_config.eos_token_id != generation_config.pad_token_id
+        assert eos_id is not None
+        assert processing_class.pad_token_id is not None
+        assert eos_id != processing_class.pad_token_id
 
         accelerator.print("===training policy===")
         stats_shape = (
@@ -1437,7 +1438,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 ref_policy,
                 reward_model,
                 processing_class,
-                generation_config,
+                None,  # CHANGED: no GenerationConfig needed
                 eos_id,
                 device,
             )
@@ -1777,21 +1778,20 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             "top_p": 1.0,
             "do_sample": True,
             "early_stopping": True,
+            "eos_token_id": self.stop_token_id,
+            "pad_token_id": processing_class.pad_token_id,
         }
-        generation_config = GenerationConfig(**generation_kwargs)
         eos_id = self.stop_token_id
-        generation_config.eos_token_id = eos_id
-        generation_config.pad_token_id = processing_class.pad_token_id
-        assert generation_config.eos_token_id is not None
-        assert generation_config.pad_token_id is not None
-        assert generation_config.eos_token_id != generation_config.pad_token_id
+        assert eos_id is not None
+        assert processing_class.pad_token_id is not None
+        assert eos_id != processing_class.pad_token_id
 
         table = defaultdict(list)
         with unwrap_model_for_generation(
             self.model,
             self.accelerator,
             gather_deepspeed3_params=self.args.ds3_gather_for_generation,
-            generation_kwargs=generation_kwargs,  # Override model.generation_config with generation_kwargs to fix transformers#42762
+            generation_kwargs=generation_kwargs,
         ) as unwrapped_model:
             for batch in self.eval_dataloader:
                 query = batch["input_ids"]
@@ -1802,7 +1802,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                         query,
                         query.shape[0],
                         processing_class.pad_token_id,
-                        generation_config,
+                        generation_kwargs,
                     )
                     response = query_response[:, context_length:]
                     postprocessed_response = response
