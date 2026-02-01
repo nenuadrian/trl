@@ -1496,6 +1496,11 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 device,
             )
 
+            # Compute reward statistics
+            reward_mean = scores.mean()
+            reward_min = scores.min()
+            reward_max = scores.max()
+
             psi_global, l_eta_full_values = self.e_step_dual_update(
                 padding_mask_p1=padding_mask_p1,
                 raw_advantages=raw_advantages,
@@ -1584,6 +1589,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     rollout_token_logprobs_mean,
                     rollout_entropy_mean,
                     policy_entropy_mean,
+                    reward_mean,
+                    reward_min,
+                    reward_max,
                     device,
                 )
             )
@@ -1761,6 +1769,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         rollout_token_logprobs_mean: torch.Tensor,
         rollout_entropy_mean: torch.Tensor,
         policy_entropy_mean: torch.Tensor,
+        reward_mean: torch.Tensor,
+        reward_min: torch.Tensor,
+        reward_max: torch.Tensor,
         device: torch.device,
     ) -> dict[str, float]:
         """Generate a dictionary of training metrics for logging."""
@@ -1836,6 +1847,15 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 self.accelerator.gather_for_metrics(rlhf_reward).mean().item()
             )
             metrics["debug/reward_std"] = scores.std().item()
+            metrics["debug/reward_mean"] = (
+                self.accelerator.gather_for_metrics(reward_mean).mean().item()
+            )
+            metrics["debug/reward_min"] = (
+                self.accelerator.gather_for_metrics(reward_min).mean().item()
+            )
+            metrics["debug/reward_max"] = (
+                self.accelerator.gather_for_metrics(reward_max).mean().item()
+            )
             metrics["policy/approxkl_avg"] = (
                 self.accelerator.gather_for_metrics(approxkl_stats).mean().item()
             )
