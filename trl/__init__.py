@@ -62,6 +62,7 @@ _import_structure = {
         "CPOTrainer",  # deprecated import
         "DPOConfig",
         "DPOTrainer",
+        "VMCPOTrainer",
         "FDivergenceConstants",
         "FDivergenceType",
         "GKDConfig",  # deprecated import
@@ -85,8 +86,8 @@ _import_structure = {
         "PPOTrainer",  # deprecated import
         "PRMConfig",  # deprecated import
         "PRMTrainer",  # deprecated import
-        "VMPOConfig",
-        "VMPOTrainer",
+        "VMPPPOConfig",
+        "VMPPPOTrainer",
         "RewardConfig",
         "RewardTrainer",
         "RichProgressCallback",

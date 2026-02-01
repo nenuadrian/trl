@@ -56,11 +56,11 @@ from ..utils import first_true_indices, get_reward
 
 
 @dataclass
-class VMPOConfig(TrainingArguments):
+class VMPPPOConfig(TrainingArguments):
     r"""
-    Configuration class for the [`experimental.vmpo.VMPOTrainer`].
+    Configuration class for the [`experimental.vmpppo.VMPPPOTrainer`].
 
-    This class includes only the parameters that are specific to VMPO training. For a full list of training arguments,
+    This class includes only the parameters that are specific to VMPPPO training. For a full list of training arguments,
     please refer to the [`~transformers.TrainingArguments`] documentation. Note that default values in this class may
     differ from those in [`~transformers.TrainingArguments`].
 
@@ -618,11 +618,11 @@ class PolicyAndValueWrapper(nn.Module):
         return self.policy(**kwargs), logits
 
 
-class VMPOTrainer(BaseTrainer):
-    """Trainer for VMPO.
+class VMPPPOTrainer(BaseTrainer):
+    """Trainer for VMPPPO.
 
     Args:
-        args ([`experimental.vmpo.VMPOConfig`]):
+        args ([`experimental.vmpppo.VMPPPOConfig`]):
             Training arguments.
         processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`]):
             Class to process the data.
@@ -652,14 +652,14 @@ class VMPOTrainer(BaseTrainer):
             will be wrapped with the specified PEFT adapter.
     """
 
-    _tag_names = ["trl", "vmpo"]
-    _name = "VMPO"
+    _tag_names = ["trl", "vmpppo"]
+    _name = "VMPPPO"
     _paper = {
         "title": "V-MPO: On-Policy Maximum a Posteriori Policy Optimization for Discrete and Continuous Control",
-        "id": "song2019vmpoonpolicymaximumposteriori",
+        "id": "song2019vmpppoonpolicymaximumposteriori",
         "citation": textwrap.dedent(
             """\
-            @misc{song2019vmpoonpolicymaximumposteriori,
+            @misc{song2019vmpppoonpolicymaximumposteriori,
                 title={V-MPO: On-Policy Maximum a Posteriori Policy Optimization for Discrete and Continuous Control}, 
                 author={H. Francis Song and Abbas Abdolmaleki and Jost Tobias Springenberg and Aidan Clark and Hubert Soyer and Jack W. Rae and Seb Noury and Arun Ahuja and Siqi Liu and Dhruva Tirumala and Nicolas Heess and Dan Belov and Martin Riedmiller and Matthew M. Botvinick},
                 year={2019},
@@ -673,7 +673,7 @@ class VMPOTrainer(BaseTrainer):
 
     def __init__(
         self,
-        args: VMPOConfig,
+        args: VMPPPOConfig,
         processing_class: (
             PreTrainedTokenizerBase
             | BaseImageProcessor

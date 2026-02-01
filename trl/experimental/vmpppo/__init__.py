@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .vmpo_trainer import VMPOTrainer, VMPOConfig
+from .vmpppo_trainer import VMPPPOTrainer, VMPPPOConfig
 
 
 __all__ = [
-    "VMPOConfig",
-    "VMPOTrainer",
+    "VMPPPOConfig",
+    "VMPPPOTrainer",
 ]
