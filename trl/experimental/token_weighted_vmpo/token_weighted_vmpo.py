@@ -106,7 +106,7 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         },
     )
     entropy_beta: float = field(
-        default=0.01,
+        default=0.005,
         metadata={
             "help": "Entropy regularization coefficient β (only applied when ψ ESS < psi_ess_min_tokens). Set 0 to disable."
         },
@@ -124,7 +124,7 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         },
     )
     alpha_lr_mult: float = field(
-        default=1.0,
+        default=10.0,
         metadata={
             "help": "Learning-rate multiplier for α dual optimizer relative to policy learning rate."
         },
@@ -418,6 +418,28 @@ def generate(
     logits = torch.stack(output.scores, 1)
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
 
+
+def ngram_repeat_count(tokens: torch.Tensor, n: int, pad_token_id: int) -> torch.Tensor:
+    """
+    tokens: [B, T]
+    returns: [B] repeat count per sequence
+    """
+    B, T = tokens.shape
+    counts = torch.zeros(B, device=tokens.device)
+
+    for i in range(B):
+        seq = tokens[i]
+        seq = seq[seq != pad_token_id]
+        if seq.numel() < n:
+            continue
+
+        ngrams = [
+            tuple(seq[j : j + n].tolist())
+            for j in range(seq.numel() - n + 1)
+        ]
+        counts[i] = len(ngrams) - len(set(ngrams))
+
+    return counts
 
 @torch.no_grad()
 def batch_generation(
@@ -1055,6 +1077,22 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 logprobs.append(logprob)
                 ref_logprobs.append(ref_logprob)
                 sequence_lengths.append(sequence_length)
+                
+                rep_bigram = ngram_repeat_count(
+                    postprocessed_response,
+                    n=2,
+                    pad_token_id=processing_class.pad_token_id,
+                )
+                rep_trigram = ngram_repeat_count(
+                    postprocessed_response,
+                    n=3,
+                    pad_token_id=processing_class.pad_token_id,
+                )
+                rep_bigram = rep_bigram.to(score.device, score.dtype)
+                rep_trigram = rep_trigram.to(score.device, score.dtype)
+
+                lambda_rep = 0.1  # start small
+                score = score - lambda_rep * (rep_bigram + 0.5 * rep_trigram)
                 scores.append(score)
                 values.append(value)
             responses = torch.cat(responses, 0)
