@@ -610,6 +610,15 @@ class PolicyAndValueWrapper(nn.Module):
         return self.policy(**kwargs), logits
 
 
+class SafeProgressCallback(ProgressCallback):
+    """Work around transformers ProgressCallback crash when training_bar is None on some ranks."""
+    def on_train_end(self, args, state, control, **kwargs):
+        bar = getattr(self, "training_bar", None)
+        if bar is not None:
+            bar.close()
+        return control
+
+
 class TokenWeightedVMPOTrainer(BaseTrainer):
     """Trainer for TokenWeightedVMPOTrainer.
 
@@ -842,6 +851,18 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         default_callbacks = DEFAULT_CALLBACKS + get_reporting_integration_callbacks(
             self.args.report_to
         )
+
+        # IMPORTANT: remove the (unsafe) default progress callback(s) entirely, then add our safe one.
+        default_callbacks = [
+            cb
+            for cb in default_callbacks
+            if not (isinstance(cb, type) and issubclass(cb, ProgressCallback))
+        ]
+
+        default_callbacks = default_callbacks + [
+            PrinterCallback if self.args.disable_tqdm else SafeProgressCallback
+        ]
+
         self.callbacks = (
             default_callbacks if callbacks is None else default_callbacks + callbacks
         )
@@ -852,9 +873,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             self.optimizer,
             self.lr_scheduler,
         )
-        self.add_callback(
-            PrinterCallback if self.args.disable_tqdm else SafeProgressCallback
-        )
+
+        # REMOVE the old self.add_callback(...) call; it can re-add the unsafe callback and resurrect the crash.
+        # self.add_callback(PrinterCallback if self.args.disable_tqdm else DEFAULT_PROGRESS_CALLBACK)
+
         self.control = TrainerControl()
         self.state = OnlineTrainerState(
             is_local_process_zero=self.is_local_process_zero(),
