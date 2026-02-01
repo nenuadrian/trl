@@ -93,7 +93,7 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         metadata={"help": "Minimum value added after softplus to keep α positive."},
     )
     psi_topk_ratio: float | None = field(
-        default=0.2,
+        default=None,
         metadata={
             "help": "Optional top-k truncation ratio for token-level ψ support (e.g., 0.2 keeps top 20% tokens by advantage). "
             "Set to None to disable."
@@ -1209,13 +1209,15 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
         kl_weighted_max_tok_accum: torch.Tensor,
-        approxkl_stats: torch.Tensor,          # NEW: write per-minibatch KL here
-        approxkl_scale: float = 1.0,           # NEW: e.g. 1/m_steps to average across M-steps
+        approxkl_stats: torch.Tensor,  # NEW: write per-minibatch KL here
+        approxkl_scale: float = 1.0,  # NEW: e.g. 1/m_steps to average across M-steps
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list, list]:
         kl_vals_last_mstep: list[torch.Tensor] = []
         b_inds = np.random.permutation(self.args.local_batch_size)
 
-        mini_batch_idx = 0  # NEW: index into approxkl_stats along the minibatch dimension
+        mini_batch_idx = (
+            0  # NEW: index into approxkl_stats along the minibatch dimension
+        )
         for start in range(0, len(b_inds), self.args.local_mini_batch_size):
             mb_inds = b_inds[start : start + self.args.local_mini_batch_size]
             mb_query = queries[mb_inds]
@@ -1245,8 +1247,13 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 entropy_stats.append(entropy_mb.detach())
 
             psi_mass_mb = psi_mb.sum()
-            if psi_mass_mb > 0:
-                policy_loss = -((psi_mb * new_logprobs).sum() / (psi_mass_mb + 1e-8))
+
+            # FIX: per-sequence policy loss (do NOT divide by psi_mass_mb)
+            # L_pi = -(1/mb) * sum_i sum_t psi[i,t] * logpi[i,t]
+            per_seq_mass = psi_mb.sum(dim=1)  # [mb]
+            valid_seq = per_seq_mass > 0
+            if valid_seq.any():
+                policy_loss = -((psi_mb * new_logprobs).sum(dim=1)[valid_seq]).mean()
             else:
                 policy_loss = torch.zeros((), device=self.accelerator.device)
 
@@ -1266,11 +1273,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 )
                 value_target = value_old_mb + delta
 
-            # ψ-weighted critic loss (EM-consistent): E_ψ[(V - target)^2]
-            weight = psi_mb * value_mask.to(dtype=psi_mb.dtype)
-            denom = weight.sum().clamp_min(1e-8)
-            if denom > 0:
-                value_loss = (((value_pred - value_target) ** 2) * weight).sum() / denom
+            # FIX: critic loss should not be ψ-weighted when predicting token-level values
+            # Use standard masked MSE over valid (non-pad) tokens.
+            if value_mask.any():
+                value_loss = ((value_pred - value_target) ** 2)[value_mask].mean()
             else:
                 value_loss = torch.zeros((), device=self.accelerator.device)
 
@@ -1470,7 +1476,11 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                         ess_rows.append(torch.zeros((), device=device))
                     else:
                         ess_rows.append(1.0 / psi_i.pow(2).sum().clamp_min(1e-8))
-                psi_ess_seq = torch.stack(ess_rows).mean() if len(ess_rows) > 0 else torch.zeros((), device=device)
+                psi_ess_seq = (
+                    torch.stack(ess_rows).mean()
+                    if len(ess_rows) > 0
+                    else torch.zeros((), device=device)
+                )
 
                 apply_entropy_reg = bool(
                     (self.args.entropy_beta > 0.0)
@@ -1686,7 +1696,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 A_max = A_sel_exp.max()
                 weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
                 Z = weights.sum().clamp_min(1e-8)
-                psi_sel = weights / Z  # sums to 1 within this sequence's selected support
+                psi_sel = (
+                    weights / Z
+                )  # sums to 1 within this sequence's selected support
 
                 psi_global[i, pos_sel] = psi_sel
 
@@ -1739,8 +1751,16 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     ess_rows.append(1.0 / psi_i.pow(2).sum().clamp_min(1e-8))
                     max_rows.append(psi_i.max())
 
-            psi_ess_tok = torch.stack(ess_rows).mean() if len(ess_rows) > 0 else torch.zeros((), device=device)
-            psi_max_tok = torch.stack(max_rows).mean() if len(max_rows) > 0 else torch.zeros((), device=device)
+            psi_ess_tok = (
+                torch.stack(ess_rows).mean()
+                if len(ess_rows) > 0
+                else torch.zeros((), device=device)
+            )
+            psi_max_tok = (
+                torch.stack(max_rows).mean()
+                if len(max_rows) > 0
+                else torch.zeros((), device=device)
+            )
 
             l_eta_mean = (
                 torch.stack(l_eta_full_values).mean()
