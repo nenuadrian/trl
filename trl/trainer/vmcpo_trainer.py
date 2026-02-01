@@ -1948,3 +1948,30 @@ class VMCPOTrainer(BaseTrainer):
             model_name = self.args.hub_model_id.split("/")[-1]
         self.create_model_card(model_name=model_name)
         super()._save_checkpoint(model, trial)
+
+    def compute_loss(
+        self,
+        model: PreTrainedModel | nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        return_outputs=False,
+        num_items_in_batch=None,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
+        compute_loss_context_manager = (
+            autocast(self.accelerator.device.type)
+            if self._peft_has_been_casted_to_bf16
+            else nullcontext()
+        )
+        with compute_loss_context_manager:
+            loss, metrics = self.get_batch_loss_metrics(
+                model, inputs, train_eval="train"
+            )
+
+        # Make sure to move the loss to the device the original accumulating loss is at back in the `Trainer` class:
+        loss = loss.to(self.args.device)
+        # force log the metrics
+        self.store_metrics(metrics, train_eval="train")
+
+        if return_outputs:
+            return loss, metrics
+
+        return loss
