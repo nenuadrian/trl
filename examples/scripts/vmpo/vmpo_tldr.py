@@ -1,26 +1,3 @@
-# Copyright 2020-2026 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-# /// script
-# dependencies = [
-#     "trl",
-#     "peft",
-#     "trackio",
-#     "kernels",
-# ]
-# ///
-
 import os
 import shutil
 
@@ -34,9 +11,51 @@ from transformers import (
     HfArgumentParser,
 )
 
-from trl import ModelConfig, ScriptArguments, get_kbit_device_map, get_peft_config, get_quantization_config
+from trl import (
+    ModelConfig,
+    ScriptArguments,
+    get_kbit_device_map,
+    get_peft_config,
+    get_quantization_config,
+)
 from trl.experimental.vmpo import VMPOConfig, VMPOTrainer
 
+"""
+python examples/scripts/vmpo/vmpo_tldr.py \
+    --dataset_name trl-lib/tldr \
+    --dataset_test_split validation \
+    --learning_rate 3e-6 \
+    --output_dir pythia-1b-deduped-tldr-preference-sft-trl-style-vmpo \
+    --per_device_train_batch_size 1 \
+    --gradient_accumulation_steps 64 \
+    --total_episodes 30000 \
+    --model_name_or_path EleutherAI/pythia-1b-deduped \
+    --sft_model_path cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr \
+    --reward_model_path cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr \
+    --missing_eos_penalty 1.0 \
+    --stop_token eos \
+    --response_length 53 \
+    --eval_strategy steps \
+    --eval_steps 100
+
+accelerate launch --config_file examples/accelerate_configs/deepspeed_zero2.yaml \
+    examples/scripts/vmpo/vmpo_tldr.py \
+    --dataset_name trl-lib/tldr \
+    --dataset_test_split validation \
+    --output_dir pythia-1b-deduped-tldr-preference-sft-trl-style-vmpo \
+    --learning_rate 3e-6 \
+    --per_device_train_batch_size 16 \
+    --gradient_accumulation_steps 4 \
+    --total_episodes 1000000 \
+    --model_name_or_path EleutherAI/pythia-1b-deduped \
+    --sft_model_path cleanrl/EleutherAI_pythia-1b-deduped__sft__tldr \
+    --reward_model_path cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr \
+    --local_rollout_forward_batch_size 16 \
+    --missing_eos_penalty 1.0 \
+    --stop_token eos \
+    --eval_strategy steps \
+    --eval_steps 100
+"""
 
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
@@ -50,7 +69,11 @@ if __name__ == "__main__":
     ################
     # Model & Tokenizer
     ################
-    dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
+    dtype = (
+        model_args.dtype
+        if model_args.dtype in ["auto", None]
+        else getattr(torch, model_args.dtype)
+    )
     model_kwargs = dict(
         revision=model_args.model_revision,
         attn_implementation=model_args.attn_implementation,
@@ -63,7 +86,9 @@ if __name__ == "__main__":
         model_kwargs["quantization_config"] = quantization_config
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, padding_side="left", trust_remote_code=model_args.trust_remote_code
+        model_args.model_name_or_path,
+        padding_side="left",
+        trust_remote_code=model_args.trust_remote_code,
     )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     value_model = AutoModelForSequenceClassification.from_pretrained(
@@ -79,13 +104,17 @@ if __name__ == "__main__":
         **model_kwargs,
     )
     policy = AutoModelForCausalLM.from_pretrained(
-        training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+        training_args.sft_model_path,
+        trust_remote_code=model_args.trust_remote_code,
+        **model_kwargs,
     )
 
     peft_config = get_peft_config(model_args)
     if peft_config is None:
         ref_policy = AutoModelForCausalLM.from_pretrained(
-            training_args.sft_model_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
+            training_args.sft_model_path,
+            trust_remote_code=model_args.trust_remote_code,
+            **model_kwargs,
         )
     else:
         ref_policy = None
@@ -95,7 +124,11 @@ if __name__ == "__main__":
     ################
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
     train_dataset = dataset[script_args.dataset_train_split]
-    eval_dataset = dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None
+    eval_dataset = (
+        dataset[script_args.dataset_test_split]
+        if training_args.eval_strategy != "no"
+        else None
+    )
 
     def prepare_dataset(dataset, tokenizer):
         """pre-tokenize the dataset before training; only collate during training"""
@@ -117,11 +150,17 @@ if __name__ == "__main__":
         if eval_dataset is not None:
             eval_dataset = prepare_dataset(eval_dataset, tokenizer)
         # filtering
-        train_dataset = train_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+        train_dataset = train_dataset.filter(
+            lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc
+        )
         if eval_dataset is not None:
-            eval_dataset = eval_dataset.filter(lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc)
+            eval_dataset = eval_dataset.filter(
+                lambda x: x["lengths"] <= 512, num_proc=training_args.dataset_num_proc
+            )
 
-    assert train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id, "The last token should not be an EOS token"
+    assert (
+        train_dataset[0]["input_ids"][-1] != tokenizer.eos_token_id
+    ), "The last token should not be an EOS token"
 
     ################
     # Training

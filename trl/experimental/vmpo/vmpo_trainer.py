@@ -988,7 +988,6 @@ class VMPOTrainer(BaseTrainer):
             rollout_logits = torch.cat(rollout_logits, 0)
             del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
             gc.collect()
-            torch.cuda.empty_cache()
 
             # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
             # Completions not passing that filter will receive a lower score.
@@ -1069,19 +1068,30 @@ class VMPOTrainer(BaseTrainer):
         values: torch.Tensor,
         padding_mask_p1: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute generalized advantage estimation (GAE) and returns."""
-        lastgaelam = 0
-        advantages_reversed = []
-        gen_length = rewards.shape[1]
-        for t in reversed(range(gen_length)):
-            nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-            delta = rewards[:, t] + self.args.gamma * nextvalues - values[:, t]
-            not_done = ~padding_mask_p1[:, t]
-            lastgaelam = delta + self.args.gamma * self.args.lam * lastgaelam * not_done
-            advantages_reversed.append(lastgaelam)
-        raw_advantages = torch.stack(advantages_reversed[::-1], dim=1)
-        returns = raw_advantages + values
-        return raw_advantages, returns
+        """Compute generalized advantage estimation (GAE) and returns with correct bootstrapping for padded trajectories."""
+        B, T = rewards.shape
+        advantages = torch.zeros_like(rewards)
+        lastgaelam = torch.zeros(B, device=rewards.device)
+
+        for t in reversed(range(T)):
+            valid_t = ~padding_mask_p1[:, t]
+
+            if t < T - 1:
+                valid_tp1 = ~padding_mask_p1[:, t + 1]
+                next_value = torch.where(
+                    valid_tp1, values[:, t + 1], torch.zeros_like(values[:, t])
+                )
+            else:
+                next_value = torch.zeros_like(values[:, t])
+
+            delta = rewards[:, t] + self.args.gamma * next_value - values[:, t]
+            lastgaelam = delta + self.args.gamma * self.args.lam * lastgaelam
+            lastgaelam = lastgaelam * valid_t
+
+            advantages[:, t] = lastgaelam
+
+        returns = advantages + values
+        return advantages, returns
 
     def train(self):
         processing_class = self.processing_class
@@ -1333,9 +1343,8 @@ class VMPOTrainer(BaseTrainer):
         # Shape: [batch, T]
         mask_valid = ~padding_mask_p1
 
-        # Number of valid tokens per sequence
-        # Clamp to 1 to avoid division by zero for degenerate sequences
-        valid_len = mask_valid.sum(dim=1).clamp_min(1)
+        # Remove unused valid_len
+        # valid_len = mask_valid.sum(dim=1).clamp_min(1)
 
         # ---- Sequence-level advantage ----
         # raw_advantages: token-level advantages A_{i,t}
@@ -1447,8 +1456,12 @@ class VMPOTrainer(BaseTrainer):
 
         kl_vals_last_mstep: list[torch.Tensor] = []
 
+        # Ensure psi_global is detached for policy loss backprop
+        psi_global = psi_global.detach()
+        psi_state = psi_state.detach()
+
         # Random permutation for minibatch SGD
-        b_inds = np.random.permutation(self.args.local_batch_size)
+        b_inds = torch.randperm(self.args.local_batch_size, device=queries.device)
 
         for start in range(0, len(b_inds), self.args.local_mini_batch_size):
             mb_inds = b_inds[start : start + self.args.local_mini_batch_size]
@@ -1519,9 +1532,8 @@ class VMPOTrainer(BaseTrainer):
             del policy_outputs
             del new_logits, new_logprobs
             del value_features_mb, value_pred
-            # Remove torch.cuda.empty_cache() here (was inside minibatch loop)
             gc.collect()
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()  # <-- REMOVE from minibatch loop
 
             # ---- Statistics ----
             kl_weighted_accum += kl_weighted_mb.detach()
