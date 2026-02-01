@@ -1208,7 +1208,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         entropy_stats: list,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
-        kl_weighted_max_tok_accum: torch.Tensor, 
+        kl_weighted_max_tok_accum: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list, list]:
         kl_vals_last_mstep: list[torch.Tensor] = []
         b_inds = np.random.permutation(self.args.local_batch_size)
@@ -1278,7 +1278,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             kl_den_mb = psi_mass_mb.clamp_min(1e-8)
             kl_mean_mb = kl_num_mb / kl_den_mb
 
-            : max ψ-weighted token KL (watch for local KL spikes)
             with torch.no_grad():
                 kl_weighted_tok = (psi_mb * kl_terms_token).masked_fill(
                     ~mask_valid_mb, float("-inf")
@@ -1438,7 +1437,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 ref_policy,
                 reward_model,
                 processing_class,
-                None,  # CHANGED: no GenerationConfig needed
+                None,
                 eos_id,
                 device,
             )
@@ -1662,7 +1661,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         self,
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
-        kl_weighted_max_tok_accum: torch.Tensor,  
+        kl_weighted_max_tok_accum: torch.Tensor,
         reward_seq: torch.Tensor,
         reward_tok: torch.Tensor,
         psi_global: torch.Tensor,
