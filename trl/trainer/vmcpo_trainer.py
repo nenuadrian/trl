@@ -55,7 +55,6 @@ from .utils import (
     flush_left,
     flush_right,
     get_config_model_id,
-    log_table_to_comet_experiment,
     pad,
     pad_to_length,
     selective_log_softmax,
@@ -305,6 +304,13 @@ class VMCPOConfig(TrainingArguments):
             "help": "Number of inner optimization steps for the temperature dual variable η during the E-step."
         },
     )
+    psi_floor_eps: float = field(
+        default=0.0,
+        metadata={
+            "help": "Soft floor for E-step weights ψ via ψ ← (1−ε)ψ + ε/N (N = number of samples). "
+            "Set to ~0.05–0.1 for preference data to prevent catastrophic ESS collapse. Set to 0 to disable."
+        },
+    )
     eps_alpha: float = field(
         default=0.01,
         metadata={"help": "KL trust region target εα for the V-MPO dual α."},
@@ -322,14 +328,6 @@ class VMCPOConfig(TrainingArguments):
         metadata={
             "help": "Whether to ignore the provided reference model and implicitly use a reference model that assigns "
             "equal probability to all responses."
-        },
-    )
-    ld_alpha: float | None = field(
-        default=None,
-        metadata={
-            "help": "α parameter from the LD-VMCPO paper, which controls the weighting of the verbose token "
-            "log-probabilities in responses. If `None`, no weighting is applied to the verbose part, and the loss is "
-            "equivalent to the standard VMCPO loss. The paper recommends setting `ld_alpha` between `0.0` and `1.0`.",
         },
     )
     sync_ref_model: bool = field(
@@ -359,13 +357,18 @@ class VMCPOConfig(TrainingArguments):
     generate_during_eval: bool = field(
         default=False,
         metadata={
-            "help": "Whether to generate and log completions from both the model and the reference model to W&B, MLFLow "
-            "or Comet during evaluation."
+            "help": "Whether to generate and log completions from both the model and the reference model to W&B "
+            "during evaluation."
         },
     )
 
     def __post_init__(self):
         self.bf16 = not (self.fp16) if self.bf16 is None else self.bf16
+
+        if not (0.0 <= self.psi_floor_eps < 1.0):
+            raise ValueError(
+                f"`psi_floor_eps` must be in [0, 1). Got {self.psi_floor_eps}."
+            )
 
         # Transformers explicitly set use_reentrant=True in the past to silence a PyTorch warning, but the default was
         # never updated once PyTorch switched to recommending use_reentrant=False. Until that change lands upstream
@@ -733,10 +736,10 @@ class VMCPOTrainer(BaseTrainer):
             inv_softplus(torch.tensor(args.alpha_init, device=device))
         )
         self.eta_optimizer = torch.optim.Adam(
-            [self.eta_raw], lr=args.learning_rate, weight_decay=0.0
+            [self.eta_raw], lr=10 * args.learning_rate, weight_decay=0.0
         )
         self.alpha_optimizer = torch.optim.Adam(
-            [self.alpha_raw], lr=args.learning_rate, weight_decay=0.0
+            [self.alpha_raw], lr=10 * args.learning_rate, weight_decay=0.0
         )
         self._latest_dual_grads = {"eta": 0.0, "alpha": 0.0}
 
@@ -1207,6 +1210,12 @@ class VMCPOTrainer(BaseTrainer):
             log_Z = torch.logsumexp(logits, dim=0)
             psi = torch.exp(logits - log_Z).detach()
 
+            # Soft ψ floor to avoid extremely peaked weights (ESS collapse) on preference data.
+            # This preserves normalization since sum(ψ)=1 ⇒ sum((1−ε)ψ + ε/N)=1.
+            if self.args.psi_floor_eps > 0:
+                eps = float(self.args.psi_floor_eps)
+                psi = psi.mul(1.0 - eps).add(eps / float(N))
+
             if not update:
                 break
 
@@ -1218,8 +1227,6 @@ class VMCPOTrainer(BaseTrainer):
             self.eta_optimizer.step()
 
             l_eta_values.append(l_eta.detach())
-
-        return psi, l_eta_values
 
         return psi, l_eta_values
 
@@ -1363,7 +1370,7 @@ class VMCPOTrainer(BaseTrainer):
         else:
             policy_loss = -((psi * logps).sum() / psi_sum)
 
-        kl_terms = logps - ref_logps
+        kl_terms = ref_logps - logps
         kl_weighted = (psi * kl_terms).sum() / psi_sum
 
         alpha = F.softplus(self.alpha_raw) + self.args.alpha_min
@@ -1576,30 +1583,6 @@ class VMCPOTrainer(BaseTrainer):
         all_logps = per_token_logps[:, 1:].sum(-1)
         output: dict[str, torch.Tensor] = {}
 
-        if (
-            self.args.ld_alpha is not None
-            and not is_ref_model
-            and not self.padding_free
-        ):
-            completion_lengths = loss_mask.sum(dim=1)
-            chosen_lengths = completion_lengths[:num_examples]
-            rejected_lengths = completion_lengths[num_examples:]
-            public_lengths = torch.min(chosen_lengths, rejected_lengths)
-            public_lengths = torch.cat([public_lengths, public_lengths], dim=0)
-
-            seq_len = per_token_logps.size(1)
-            position_range = torch.arange(
-                seq_len, device=per_token_logps.device
-            ).expand_as(per_token_logps)
-            mask = position_range < completion_lengths.unsqueeze(1)
-            ld_mask = position_range < public_lengths.unsqueeze(1)
-
-            front_mask = (ld_mask & mask).float()
-            rear_mask = (~ld_mask & mask).float()
-            front_logps = (per_token_logps * front_mask).sum(dim=1)
-            rear_logps = (per_token_logps * rear_mask).sum(dim=1)
-            all_logps = front_logps + self.args.ld_alpha * rear_logps
-
         chosen_logps = all_logps[:num_examples]
         rejected_logps = all_logps[num_examples:]
         output["chosen_logps"] = chosen_logps
@@ -1731,12 +1714,17 @@ class VMCPOTrainer(BaseTrainer):
         psi_state = psi
         psi_ess = 1.0 / (psi_state.square().sum().clamp_min(1e-8))
         psi_max = psi_state.max()
+        psi_min = psi_state.min()
         metrics[f"{prefix}psi/ess"] = (
             self.accelerator.gather_for_metrics(psi_ess.unsqueeze(0)).mean().item()
         )
         metrics[f"{prefix}psi/max"] = (
             self.accelerator.gather_for_metrics(psi_max.unsqueeze(0)).mean().item()
         )
+        metrics[f"{prefix}psi/min"] = (
+            self.accelerator.gather_for_metrics(psi_min.unsqueeze(0)).mean().item()
+        )
+        metrics[f"{prefix}psi/floor_eps"] = float(self.args.psi_floor_eps)
         metrics[f"{prefix}dual/eta_value"] = (
             self.accelerator.gather_for_metrics(eta_value.detach().unsqueeze(0))
             .mean()
@@ -1772,33 +1760,6 @@ class VMCPOTrainer(BaseTrainer):
             )
 
         return loss, metrics
-
-    def compute_loss(
-        self,
-        model: PreTrainedModel | nn.Module,
-        inputs: dict[str, torch.Tensor | Any],
-        return_outputs=False,
-        num_items_in_batch=None,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, float]]:
-        compute_loss_context_manager = (
-            autocast(self.accelerator.device.type)
-            if self._peft_has_been_casted_to_bf16
-            else nullcontext()
-        )
-        with compute_loss_context_manager:
-            loss, metrics = self.get_batch_loss_metrics(
-                model, inputs, train_eval="train"
-            )
-
-        # Make sure to move the loss to the device the original accumulating loss is at back in the `Trainer` class:
-        loss = loss.to(self.args.device)
-        # force log the metrics
-        self.store_metrics(metrics, train_eval="train")
-
-        if return_outputs:
-            return loss, metrics
-
-        return loss
 
     def generate_from_model_and_ref(
         self, model, batch: dict[str, torch.LongTensor]
@@ -1949,15 +1910,6 @@ class VMCPOTrainer(BaseTrainer):
             )
             if "wandb" in self.args.report_to and self.accelerator.is_main_process:
                 wandb.log({"game_log": wandb.Table(data=table)})
-
-            if "comet_ml" in self.args.report_to:
-                log_table_to_comet_experiment(
-                    name="game_log.csv",
-                    table=table,
-                )
-
-            if "mlflow" in self.args.report_to and self.accelerator.is_main_process:
-                mlflow.log_table(data=table, artifact_file="game_log.json")
 
         # Base evaluation
         initial_output = super().evaluation_loop(
