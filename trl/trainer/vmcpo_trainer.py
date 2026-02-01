@@ -1252,6 +1252,107 @@ class VMCPOTrainer(BaseTrainer):
 
         return chosen_adv, rejected_adv
 
+     @staticmethod
+    def concatenated_inputs(
+        batch: dict[str, list | torch.LongTensor], padding_value: int
+    ) -> dict[str, torch.LongTensor]:
+        """
+        Concatenate the `chosen` and `rejected` inputs from the batch into a single tensor for both the prompt and
+        completion sequences.
+
+        Args:
+            batch (`dict[str, list | torch.LongTensor]`):
+                A batch of input data. The batch must contain the following keys:
+
+                - `"prompt_input_ids"`: Tensor of shape `(batch_size, prompt_length)` representing the prompt input
+                  IDs.
+                - `"chosen_input_ids"`: Tensor of shape `(batch_size, chosen_length)` representing the chosen
+                  completion input IDs.
+                - `"rejected_input_ids"`: Tensor of shape `(batch_size, rejected_length)` representing the rejected
+                  completion input IDs.
+                - `"prompt_pixel_values"` (optional): Tensor for pixel values, if available.
+                - `"prompt_pixel_attention_mask"` (optional): Tensor for pixel attention masks, if available.
+
+            padding_value (`int`):
+                The padding value to use for the concatenated completion sequences (`chosen_input_ids` and
+                `rejected_input_ids`).
+
+        Returns:
+            `dict[str, torch.LongTensor]`: A dictionary containing:
+
+                - `"prompt_input_ids"`: Concatenated prompt input IDs of shape `(2 * batch_size, prompt_length)`.
+                - `"completion_input_ids"`: Concatenated chosen and rejected completion input IDs of shape `(2 *
+                  batch_size, max_completion_length)`.
+                - `"prompt_attention_mask"`: Concatenated prompt attention masks of shape `(2 * batch_size,
+                  prompt_length)`.
+                - `"completion_attention_mask"`: Concatenated chosen and rejected attention masks of shape `(2 *
+                  batch_size, max_completion_length)`.
+                - `"pixel_values"` (optional): Concatenated pixel values if `"prompt_pixel_values"` are present.
+                - `"pixel_attention_mask"` (optional): Concatenated pixel attention masks if
+                  `"prompt_pixel_attention_mask"` are present.
+
+        Notes:
+            The completion input IDs and attention masks are padded to the maximum completion length of the chosen or
+            rejected sequences.
+        """
+        output = {}
+
+        # For the prompt, the input_ids are the same for both the chosen and rejected responses
+        output["prompt_input_ids"] = torch.cat(
+            [batch["prompt_input_ids"], batch["prompt_input_ids"]], dim=0
+        )
+        output["prompt_attention_mask"] = torch.cat(
+            [batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0
+        )
+        if "pixel_values" in batch:
+            output["pixel_values"] = torch.cat(
+                [batch["pixel_values"], batch["pixel_values"]], dim=0
+            )
+
+        if "pixel_attention_mask" in batch:
+            output["pixel_attention_mask"] = torch.cat(
+                [batch["pixel_attention_mask"], batch["pixel_attention_mask"]], dim=0
+            )
+        if "image_sizes" in batch:
+            output["image_sizes"] = torch.cat(
+                [batch["image_sizes"], batch["image_sizes"]], dim=0
+            )
+        if "token_type_ids" in batch:
+            output["token_type_ids"] = torch.cat(
+                (batch["token_type_ids"], batch["token_type_ids"])
+            )
+
+        # Concatenate the chosen and rejected completions
+        max_completion_length = max(
+            batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1]
+        )
+        output["completion_input_ids"] = torch.cat(
+            (
+                pad_to_length(
+                    batch["chosen_input_ids"],
+                    max_completion_length,
+                    pad_value=padding_value,
+                ),
+                pad_to_length(
+                    batch["rejected_input_ids"],
+                    max_completion_length,
+                    pad_value=padding_value,
+                ),
+            ),
+        )
+        output["completion_attention_mask"] = torch.cat(
+            (
+                pad_to_length(
+                    batch["chosen_attention_mask"], max_completion_length, pad_value=0
+                ),
+                pad_to_length(
+                    batch["rejected_attention_mask"], max_completion_length, pad_value=0
+                ),
+            ),
+        )
+
+        return output
+    
     def _m_step(
         self, logps: torch.Tensor, ref_logps: torch.Tensor, psi: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
