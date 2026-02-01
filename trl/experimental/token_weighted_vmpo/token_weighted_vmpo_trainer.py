@@ -155,6 +155,13 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         default=1e-4,
         metadata={"help": "Minimum value added after softplus to keep α positive."},
     )
+    psi_topk_ratio: float | None = field(
+        default=0.2,
+        metadata={
+            "help": "Optional top-k truncation ratio for token-level ψ support (e.g., 0.2 keeps top 20% tokens by advantage). "
+            "Set to None to disable."
+        },
+    )
 
     # Parameters whose default values are overridden from TrainingArguments
     logging_steps: float = field(
@@ -363,6 +370,8 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             )
         if self.eos_bonus < 0:
             raise ValueError("`eos_bonus` must be non-negative.")
+        if self.psi_topk_ratio is not None and not (0.0 < self.psi_topk_ratio <= 1.0):
+            raise ValueError("`psi_topk_ratio` must be in (0, 1] or None.")
         super().__post_init__()
 
 
@@ -1510,16 +1519,27 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         if n_tok == 0:
             return psi_global, l_eta_full_values
 
-        # Dual optimization over η (token-level log-mean-exp)
+        # Optional: top-k truncation of support (V-MPO-style)
+        if self.args.psi_topk_ratio is None or self.args.psi_topk_ratio >= 1.0:
+            mask_topk = torch.ones_like(A_valid, dtype=torch.bool)
+        else:
+            k = max(1, int(self.args.psi_topk_ratio * n_tok))
+            threshold = torch.topk(A_valid, k).values[-1]
+            mask_topk = A_valid >= threshold
+
+        A_sel = A_valid[mask_topk]
+        n_sel = A_sel.numel()
+        if n_sel == 0:
+            return psi_global, l_eta_full_values
+
+        # Dual optimization over η (token-level log-mean-exp, restricted to selected support)
         for _ in range(self.args.eta_inner_steps):
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-            A_max = A_valid.max()
-            weights = torch.exp((A_valid - A_max) / (eta + 1e-8))
+            A_max = A_sel.max()
+            weights = torch.exp((A_sel - A_max) / (eta + 1e-8))
             Z = weights.sum().clamp_min(1e-8)
 
-            # log( (1/N) Σ exp(A/η) ) in a stable way:
-            # Σ exp(A/η) = exp(A_max/η) * Σ exp((A-A_max)/η)
-            log_mean_exp = torch.log(Z) + (A_max / (eta + 1e-8)) - math.log(n_tok)
+            log_mean_exp = torch.log(Z) + (A_max / (eta + 1e-8)) - math.log(n_sel)
             l_eta = eta * (self.args.eps_eta + log_mean_exp)
 
             self.eta_optimizer.zero_grad()
@@ -1527,13 +1547,16 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             self.eta_optimizer.step()
             l_eta_full_values.append(l_eta.detach())
 
-        # Construct ψ with final η
+        # Construct ψ with final η (scatter back into [B, T])
         with torch.no_grad():
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-            A_max = A_valid.max()
-            weights = torch.exp((A_valid - A_max) / (eta + 1e-8))
+            A_max = A_sel.max()
+            weights = torch.exp((A_sel - A_max) / (eta + 1e-8))
             Z = weights.sum().clamp_min(1e-8)
-            psi_flat = weights / Z
+            psi_sel = weights / Z  # sums to 1 over selected tokens
+
+            psi_flat = torch.zeros_like(A_valid)
+            psi_flat[mask_topk] = psi_sel
             psi_global[mask_valid] = psi_flat
 
         return psi_global, l_eta_full_values
@@ -1638,6 +1661,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             metrics["policy/token_logprobs_mean"] = (
                 self.accelerator.gather_for_metrics(token_logprobs_mean).mean().item()
             )
+
+            # Optional sanity checks for truncation (won't error if disabled)
+            metrics["psi/topk_ratio"] = float(self.args.psi_topk_ratio or 1.0)
+            metrics["psi/num_tok_nonzero"] = float((psi_global > 0).sum().item())
 
         return metrics
 
