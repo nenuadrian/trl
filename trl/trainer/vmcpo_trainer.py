@@ -1252,7 +1252,7 @@ class VMCPOTrainer(BaseTrainer):
 
         return chosen_adv, rejected_adv
 
-     @staticmethod
+    @staticmethod
     def concatenated_inputs(
         batch: dict[str, list | torch.LongTensor], padding_value: int
     ) -> dict[str, torch.LongTensor]:
@@ -1265,11 +1265,11 @@ class VMCPOTrainer(BaseTrainer):
                 A batch of input data. The batch must contain the following keys:
 
                 - `"prompt_input_ids"`: Tensor of shape `(batch_size, prompt_length)` representing the prompt input
-                  IDs.
+                    IDs.
                 - `"chosen_input_ids"`: Tensor of shape `(batch_size, chosen_length)` representing the chosen
-                  completion input IDs.
+                    completion input IDs.
                 - `"rejected_input_ids"`: Tensor of shape `(batch_size, rejected_length)` representing the rejected
-                  completion input IDs.
+                    completion input IDs.
                 - `"prompt_pixel_values"` (optional): Tensor for pixel values, if available.
                 - `"prompt_pixel_attention_mask"` (optional): Tensor for pixel attention masks, if available.
 
@@ -1282,14 +1282,14 @@ class VMCPOTrainer(BaseTrainer):
 
                 - `"prompt_input_ids"`: Concatenated prompt input IDs of shape `(2 * batch_size, prompt_length)`.
                 - `"completion_input_ids"`: Concatenated chosen and rejected completion input IDs of shape `(2 *
-                  batch_size, max_completion_length)`.
+                    batch_size, max_completion_length)`.
                 - `"prompt_attention_mask"`: Concatenated prompt attention masks of shape `(2 * batch_size,
-                  prompt_length)`.
+                    prompt_length)`.
                 - `"completion_attention_mask"`: Concatenated chosen and rejected attention masks of shape `(2 *
-                  batch_size, max_completion_length)`.
+                    batch_size, max_completion_length)`.
                 - `"pixel_values"` (optional): Concatenated pixel values if `"prompt_pixel_values"` are present.
                 - `"pixel_attention_mask"` (optional): Concatenated pixel attention masks if
-                  `"prompt_pixel_attention_mask"` are present.
+                    `"prompt_pixel_attention_mask"` are present.
 
         Notes:
             The completion input IDs and attention masks are padded to the maximum completion length of the chosen or
