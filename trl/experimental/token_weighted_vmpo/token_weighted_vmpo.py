@@ -238,6 +238,12 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             "help": "Optional positive shaping reward added at the EOS position."
         },
     )
+    lambda_rep: float = field(
+        default=0.1,
+        metadata={
+            "help": "Repetition penalty coefficient for n-gram repetitions (applied as: score - lambda_rep * (rep_bigram + 0.5 * rep_trigram))."
+        },
+    )
     sft_model_path: str = field(
         default="EleutherAI/pythia-160m",
         metadata={"help": "Path to the SFT model."},
@@ -1089,8 +1095,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 rep_bigram = rep_bigram.to(score.device, score.dtype)
                 rep_trigram = rep_trigram.to(score.device, score.dtype)
 
-                lambda_rep = 0.1  # start small
-                score = score - lambda_rep * (rep_bigram + 0.5 * rep_trigram)
+                score = score - self.args.lambda_rep * (rep_bigram + 0.5 * rep_trigram)
                 scores.append(score)
                 values.append(value)
             responses = torch.cat(responses, 0)
