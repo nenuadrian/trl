@@ -1514,6 +1514,10 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             reward_min = scores.min()
             reward_max = scores.max()
             reward_std = scores.std()
+            
+            # batch-level centring
+            raw_advantages = raw_advantages - raw_advantages.mean()
+
 
             psi_global, l_eta_full_values = self.e_step_dual_update(
                 padding_mask_p1=padding_mask_p1,
@@ -1680,9 +1684,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 per_seq.append(None)
                 continue
 
-            # Center within sequence (trajectory analogue)
-            A_i = A_i - A_i.mean()
-
             if self.args.psi_topk_ratio is None or self.args.psi_topk_ratio >= 1.0:
                 mask_topk_i = torch.ones_like(A_i, dtype=torch.bool)
             else:
@@ -1763,9 +1764,12 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 )  # sums to 1 within this sequence's selected support
 
                 psi_global[i, pos_sel] = psi_sel
-                Ni = mask_valid[i].sum().item()
-                eps = 0.05
-                psi_global[i] = (1 - eps) * psi_global[i] + eps / Ni
+                
+                n_sel = pos_sel.numel()
+                eps = 0.01
+                psi_global[i, pos_sel] = (  
+                    (1 - eps) * psi_global[i, pos_sel] + eps / n_sel
+                )
 
         return psi_global, l_eta_full_values
 
