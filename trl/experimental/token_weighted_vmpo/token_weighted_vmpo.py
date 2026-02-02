@@ -1763,6 +1763,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 )  # sums to 1 within this sequence's selected support
 
                 psi_global[i, pos_sel] = psi_sel
+                Ni = mask_valid[i].sum().item()
+                eps = 0.05
+                psi_global[i] = (1 - eps) * psi_global[i] + eps / Ni
 
         return psi_global, l_eta_full_values
 
