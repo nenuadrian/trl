@@ -22,7 +22,6 @@ from transformers import (
     BaseImageProcessor,
     DataCollatorWithPadding,
     FeatureExtractionMixin,
-    GenerationConfig,
     PreTrainedTokenizerBase,
     ProcessorMixin,
     TrainerCallback,
@@ -35,7 +34,6 @@ from transformers.trainer_callback import (
     CallbackHandler,
     ExportableState,
     PrinterCallback,
-    ProgressCallback,
 )
 from transformers import TrainingArguments
 from transformers.utils import ModelOutput, is_peft_available, is_rich_available
@@ -49,7 +47,6 @@ from ...trainer.base_trainer import BaseTrainer
 from ...trainer.utils import (
     disable_dropout_in_model,
     empty_cache,
-    log_table_to_comet_experiment,
     pad,
     selective_log_softmax,
 )
@@ -169,7 +166,6 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
             "restarts."
         },
     )
-
     run_name: str | None = field(
         default=None,
         metadata={"help": "Name of the run."},
@@ -236,12 +232,6 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         default=0.1,
         metadata={
             "help": "Optional positive shaping reward added at the EOS position."
-        },
-    )
-    lambda_rep: float = field(
-        default=0.1,
-        metadata={
-            "help": "Repetition penalty coefficient for n-gram repetitions (applied as: score - lambda_rep * (rep_bigram + 0.5 * rep_trigram))."
         },
     )
     sft_model_path: str = field(
@@ -412,8 +402,6 @@ def generate(
     attention_mask = queries != pad_token_id
     input_ids = torch.masked_fill(queries, ~attention_mask, 0)
 
-    # NOTE: Pass generation parameters explicitly (no generation_config) to avoid
-    # "Please pass either a generation_config object OR all generation parameters explicitly, but not both."
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -423,26 +411,6 @@ def generate(
     )
     logits = torch.stack(output.scores, 1)
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1), logits
-
-
-def ngram_repeat_count(tokens: torch.Tensor, n: int, pad_token_id: int) -> torch.Tensor:
-    """
-    tokens: [B, T]
-    returns: [B] repeat count per sequence
-    """
-    B, T = tokens.shape
-    counts = torch.zeros(B, device=tokens.device)
-
-    for i in range(B):
-        seq = tokens[i]
-        seq = seq[seq != pad_token_id]
-        if seq.numel() < n:
-            continue
-
-        ngrams = [tuple(seq[j : j + n].tolist()) for j in range(seq.numel() - n + 1)]
-        counts[i] = len(ngrams) - len(set(ngrams))
-
-    return counts
 
 
 @torch.no_grad()
@@ -580,46 +548,6 @@ class OnlineTrainerState(TrainerState):
     episode: int = 0
 
 
-def masked_mean(
-    values: torch.Tensor, mask: torch.Tensor, axis: bool | None = None
-) -> torch.Tensor:
-    """Compute mean of tensor with a masked values."""
-    if axis is not None:
-        return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
-    else:
-        return (values * mask).sum() / mask.sum()
-
-
-def masked_var(
-    values: torch.Tensor, mask: torch.Tensor, unbiased: bool = True
-) -> torch.Tensor:
-    """Compute variance of tensor with masked values."""
-    mean = masked_mean(values, mask)
-    centered_values = values - mean
-    variance = masked_mean(centered_values**2, mask)
-    mask_sum = mask.sum()
-    if mask_sum == 0:
-        raise ValueError(
-            "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
-            "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
-        )
-    if unbiased and mask_sum > 1:
-        bessel_correction = mask_sum / (mask_sum - 1)
-        variance = variance * bessel_correction
-    return variance
-
-
-def masked_whiten(
-    values: torch.Tensor, mask: torch.Tensor, shift_mean: bool = True
-) -> torch.Tensor:
-    """Whiten values with masked values."""
-    mean, var = masked_mean(values, mask), masked_var(values, mask)
-    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
-    if not shift_mean:
-        whitened += mean
-    return whitened
-
-
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
 # we did this we can do a single `model = accelerator.prepare(model)`
 class PolicyAndValueWrapper(nn.Module):
@@ -637,38 +565,7 @@ class PolicyAndValueWrapper(nn.Module):
 
 
 class TokenWeightedVMPOTrainer(BaseTrainer):
-    """Trainer for TokenWeightedVMPOTrainer.
-
-    Args:
-        args ([`experimental.token_weighted_vmpo_trainer.TokenWeightedVMPOTrainerConfig`]):
-            Training arguments.
-        processing_class ([`~transformers.PreTrainedTokenizerBase`], [`~transformers.BaseImageProcessor`], [`~transformers.FeatureExtractionMixin`] or [`~transformers.ProcessorMixin`]):
-            Class to process the data.
-        model (`torch.nn.Module`):
-            Model to be trained. This is the policy model.
-        ref_model (`torch.nn.Module`, *optional*):
-            Reference model used to compute the KL divergence. If `None`, a copy of the policy model is created.
-        reward_model (`torch.nn.Module`):
-            Reward model used to compute the rewards.
-        train_dataset ([`~datasets.Dataset`]):
-            Dataset for training.
-        value_model (`torch.nn.Module`):
-            Value model used to predict the value of a state.
-        data_collator ([`~transformers.DataCollatorWithPadding`], *optional*):
-            Data collator to batch and pad samples from the dataset. If `None`, a default data collator is created
-            using the `processing_class`.
-        eval_dataset ([`~datasets.Dataset`] or `dict` of [`~datasets.Dataset`], *optional*):
-            Dataset for evaluation.
-        optimizers (`tuple` of `torch.optim.Optimizer` and `torch.optim.lr_scheduler.LambdaLR`, *optional*, defaults to `(None, None)`):
-            Tuple containing the optimizer and the learning rate scheduler to use for training. If `None`, the
-            optimizer and the learning rate scheduler are created using the
-            [`~transformers.Trainer.create_optimizer_and_scheduler`] method.
-        callbacks (`list` of [`~transformers.TrainerCallback`], *optional*):
-            Callbacks to use during training.
-        peft_config ([`~peft.PeftConfig`], *optional*):
-            PEFT configuration to use PEFT for training. If `None`, PEFT is not used. If provided, the policy `model`
-            will be wrapped with the specified PEFT adapter.
-    """
+    """Trainer for TokenWeightedVMPOTrainer."""
 
     _tag_names = ["trl", "token_weighted_vmpo_trainer"]
     _name = "TokenWeightedVMPOTrainer"
@@ -977,7 +874,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         ref_policy,
         reward_model,
         processing_class,
-        generation_config,
         eos_id,
         device,
     ):
@@ -1082,20 +978,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 ref_logprobs.append(ref_logprob)
                 sequence_lengths.append(sequence_length)
 
-                rep_bigram = ngram_repeat_count(
-                    postprocessed_response,
-                    n=2,
-                    pad_token_id=processing_class.pad_token_id,
-                )
-                rep_trigram = ngram_repeat_count(
-                    postprocessed_response,
-                    n=3,
-                    pad_token_id=processing_class.pad_token_id,
-                )
-                rep_bigram = rep_bigram.to(score.device, score.dtype)
-                rep_trigram = rep_trigram.to(score.device, score.dtype)
-
-                score = score - self.args.lambda_rep * (rep_bigram + 0.5 * rep_trigram)
                 scores.append(score)
                 values.append(value)
             responses = torch.cat(responses, 0)
@@ -1153,7 +1035,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             # --- entropy diagnostic: mean token logprob over valid (non-pad) response tokens ---
             valid_token_mask = ~padding_mask
-            token_logprobs_mean = logprobs.sum() / (valid_token_mask.sum() + 1e-8)
             # --- end entropy diagnostic ---
 
             # rollout logits alignment check
@@ -1255,15 +1136,13 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         kl_weighted_num_accum: torch.Tensor,
         kl_weighted_den_accum: torch.Tensor,
         kl_weighted_max_tok_accum: torch.Tensor,
-        approxkl_stats: torch.Tensor,  # NEW: write per-minibatch KL here
-        approxkl_scale: float = 1.0,  # NEW: e.g. 1/m_steps to average across M-steps
+        approxkl_stats: torch.Tensor,  # write per-minibatch KL here
+        approxkl_scale: float = 1.0,  # e.g. 1/m_steps to average across M-steps
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list, list]:
         kl_vals_last_mstep: list[torch.Tensor] = []
         b_inds = np.random.permutation(self.args.local_batch_size)
 
-        mini_batch_idx = (
-            0  # NEW: index into approxkl_stats along the minibatch dimension
-        )
+        mini_batch_idx = 0  # index into approxkl_stats along the minibatch dimension
         for start in range(0, len(b_inds), self.args.local_mini_batch_size):
             mb_inds = b_inds[start : start + self.args.local_mini_batch_size]
             mb_query = queries[mb_inds]
@@ -1332,7 +1211,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             kl_den_mb = psi_mass_mb.clamp_min(1e-8)
             kl_mean_mb = kl_num_mb / kl_den_mb
 
-            # NEW: populate approxkl_stats (avoid mean dilution by filling all grad-accum columns)
+            # populate approxkl_stats (avoid mean dilution by filling all grad-accum columns)
             if approxkl_stats is not None and mini_batch_idx < approxkl_stats.shape[0]:
                 approxkl_stats[mini_batch_idx, :].add_(
                     kl_mean_mb.detach() * float(approxkl_scale)
@@ -1376,7 +1255,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             vf_losses.append(value_loss.detach())
             kl_vals_last_mstep.append(kl_mean_mb.detach())
 
-            mini_batch_idx += 1  # NEW
+            mini_batch_idx += 1
 
         # α dual update: enforce E_ψ[KL] <= eps_alpha
         self.alpha_optimizer.zero_grad()
@@ -1504,7 +1383,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 ref_policy,
                 reward_model,
                 processing_class,
-                None,
                 eos_id,
                 device,
             )
@@ -1514,10 +1392,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             reward_min = scores.min()
             reward_max = scores.max()
             reward_std = scores.std()
-            
+
             # batch-level centring
             raw_advantages = raw_advantages - raw_advantages.mean()
-
 
             psi_global, l_eta_full_values = self.e_step_dual_update(
                 padding_mask_p1=padding_mask_p1,
@@ -1764,12 +1641,12 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 )  # sums to 1 within this sequence's selected support
 
                 psi_global[i, pos_sel] = psi_sel
-                
+
                 n_sel = pos_sel.numel()
                 eps = 0.01
-                psi_global[i, pos_sel] = (  
-                    (1 - eps) * psi_global[i, pos_sel] + eps / n_sel
-                )
+                psi_global[i, pos_sel] = (1 - eps) * psi_global[
+                    i, pos_sel
+                ] + eps / n_sel
 
         return psi_global, l_eta_full_values
 
@@ -2028,17 +1905,11 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         if self.accelerator.is_main_process:
             if is_rich_available():
                 print_rich_table(df.iloc[0 : 0 + 5])
-            if "wandb" in args.report_to:
-                import wandb
 
-                if wandb.run is not None:
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
+            import wandb
 
-            if "comet_ml" in args.report_to:
-                log_table_to_comet_experiment(
-                    name="completions.csv",
-                    table=df,
-                )
+            if wandb.run is not None:
+                wandb.log({"completions": wandb.Table(dataframe=df)})
 
     # Ensure the model card is saved along with the checkpoint
     def _save_checkpoint(self, model, trial):
