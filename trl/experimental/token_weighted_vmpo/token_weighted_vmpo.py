@@ -1017,8 +1017,11 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             valid_token_mask = ~padding_mask
 
             # Mean token logprob under the rollout policy (sampling proxy; NOT optimization entropy)
-            rollout_token_logprobs_mean = logprobs.sum() / (
-                valid_token_mask.sum() + 1e-8
+            valid_lp = logprobs[valid_token_mask]
+            rollout_token_logprobs_mean = (
+                valid_lp.mean()
+                if valid_lp.numel() > 0
+                else torch.tensor(0.0, device=logprobs.device)
             )
 
             # True token entropy of the rollout distribution from rollout logits (still sampling-time)
@@ -1463,6 +1466,24 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 if len(entropy_stats) > 0
                 else torch.zeros((), device=device)
             )
+
+            # Populate pg_loss_stats and vf_loss_stats with real mean losses
+            with torch.no_grad():
+                pg_loss_mean = (
+                    torch.stack(pg_losses).mean()
+                    if len(pg_losses) > 0
+                    else torch.zeros((), device=device)
+                )
+                vf_loss_mean = (
+                    torch.stack(vf_losses).mean()
+                    if len(vf_losses) > 0
+                    else torch.zeros((), device=device)
+                )
+                pg_loss_stats.zero_()
+                vf_loss_stats.zero_()
+                pg_loss_stats[0, 0] = pg_loss_mean
+                vf_loss_stats[0, 0] = vf_loss_mean
+
             self.state.global_step += 1
             self.state.epoch = self.state.episode / self.train_dataset_len
             self.log(
