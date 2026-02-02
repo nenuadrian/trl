@@ -364,7 +364,7 @@ if is_peft_available():
     from peft import PeftConfig, PeftModel, get_peft_model
 
 
-INVALID_LOGPROB = 0.0
+INVALID_LOGPROB = float("-inf")
 
 
 def inv_softplus(x: torch.Tensor) -> torch.Tensor:
@@ -993,15 +993,15 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             empty_cache()
             gc.collect()
 
-            # Center rewards before advantage computation (critical for V-MPO ψ)
-            reward_mean_raw = scores.mean()
-            scores = scores - reward_mean_raw
-
             # Response Processing 3. Filter completion. Ensure that the sample contains stop_token_id
             # Completions not passing that filter will receive a lower score.
             contain_eos_token_post = (postprocessed_responses == eos_id).any(dim=1)
             if self.args.missing_eos_penalty is not None:
                 scores[~contain_eos_token_post] -= self.args.missing_eos_penalty
+
+            # Center rewards before advantage computation (critical for V-MPO ψ)
+            reward_mean_raw = scores.mean()
+            scores = scores - reward_mean_raw
 
             # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
             response_idxs = torch.arange(
