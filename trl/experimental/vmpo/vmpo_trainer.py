@@ -1296,35 +1296,34 @@ class VMPOTrainer(BaseTrainer):
             # Global E-step (compute ψ once per rollout and update η/α)
             eta = F.softplus(self.model.eta_raw) + args.eta_min
             alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
-            # sequence-level ψ: aggregate advantages per sequence before weighting
+            # token-level ψ over all valid tokens
             mask_valid = ~padding_mask
-            adv_seq = (raw_advantages.masked_fill(~mask_valid, 0)).sum(dim=1)
-            adv_seq_eta = adv_seq
+            A_valid = raw_advantages.detach()[mask_valid]
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
-            num_seqs = adv_seq.numel()
-            if num_seqs > 0:
-                top_k = int(torch.ceil(torch.tensor(num_seqs * args.top_frac)).item())
-                if top_k > 0:
-                    threshold = adv_seq.topk(top_k).values.min()
-                    mask_top_seq = adv_seq >= threshold
-                    w_seq = torch.zeros_like(adv_seq)
-                    max_adv_seq = adv_seq[mask_top_seq].max()
-                    w_seq[mask_top_seq] = torch.exp(
-                        (adv_seq[mask_top_seq] - max_adv_seq) / (eta + 1e-8)
-                    )
-                    w_sum = w_seq.sum()
-                    psi_seq = torch.where(
-                        mask_top_seq, w_seq / (w_sum + 1e-8), torch.zeros_like(w_seq)
-                    )
-                    psi_seq = psi_seq / psi_seq.sum().clamp_min(1e-8)
-                    psi_global = psi_seq[:, None] * mask_valid
-                    log_mean_exp = torch.logsumexp(
-                        adv_seq_eta[mask_top_seq] / (eta + 1e-8), dim=0
-                    ) - torch.log(
-                        torch.tensor(float(mask_top_seq.sum()), device=device)
-                    )
-                    l_eta = eta * (args.eps_eta + log_mean_exp)
+            num_valid = A_valid.numel()
+            if num_valid > 0:
+                top_k = int(torch.ceil(torch.tensor(num_valid * args.top_frac)).item())
+                top_k = max(top_k, 1)
+                A_kept = A_valid
+                if top_k < num_valid:
+                    threshold = torch.topk(A_valid, top_k).values.min()
+                    keep = A_valid >= threshold
+                    A_kept = A_valid[keep]
+                else:
+                    keep = torch.ones_like(A_valid, dtype=torch.bool)
+
+                A_max = A_kept.max()
+                weights = torch.zeros_like(A_valid)
+                weights[keep] = torch.exp((A_valid[keep] - A_max) / eta)
+                Z = weights.sum().clamp_min(1e-8)
+                psi_flat = weights / Z
+                psi_global[mask_valid] = psi_flat
+
+                log_mean_exp = torch.logsumexp(A_kept / (eta + 1e-8), dim=0) - math.log(
+                    A_kept.numel()
+                )
+                l_eta = eta * (args.eps_eta + log_mean_exp)
             self.eta_optimizer.zero_grad()
             if l_eta.requires_grad:
                 l_eta.backward(retain_graph=True)
@@ -1332,8 +1331,6 @@ class VMPOTrainer(BaseTrainer):
                 l_eta_full_values.append(l_eta.detach())
             # detach ψ before policy/value updates to avoid in-place versioning issues
             psi_global = psi_global.detach()
-            psi_state = psi_global.sum(dim=1)
-            psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
             # Do multiple epochs of V-MPO training
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
@@ -1350,7 +1347,6 @@ class VMPOTrainer(BaseTrainer):
                     mb_response = responses[mini_batch_inds]
                     mb_query_response = torch.cat((mb_query, mb_response), 1)
                     psi_mb = psi_global[mini_batch_inds]
-                    psi_state_mb = psi_state[mini_batch_inds]
                     mask_valid_mb = ~padding_mask[mini_batch_inds]
 
                     policy_outputs = forward(
@@ -1397,15 +1393,13 @@ class VMPOTrainer(BaseTrainer):
                     entropy_seq = (entropy * mask_valid_mb).sum(dim=1) / (
                         mask_valid_mb.sum(dim=1) + 1e-8
                     )
-                    entropy_mean = (psi_state_mb * entropy_seq).sum()
-                    # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
-                    kl_terms_mb = (
+                    entropy_tok = entropy * mask_valid_mb
+                    entropy_mean = (psi_mb * entropy_tok).sum()
+                    # VMPO needs ψ-weighted KL(old‖new) at the token level
+                    kl_tok_mb = (
                         logprobs[mini_batch_inds] - new_logprobs
                     ) * mask_valid_mb
-                    kl_state_mb = kl_terms_mb.sum(dim=1) / (
-                        mask_valid_mb.sum(dim=1) + 1e-8
-                    )
-                    kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
+                    kl_weighted_mb = (psi_mb * kl_tok_mb).sum()
                     alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
                     beta_entropy = args.beta_entropy * math.exp(
                         -args.beta_entropy_decay * (update - 1)
@@ -1458,7 +1452,6 @@ class VMPOTrainer(BaseTrainer):
                 eta_grad = self.model.eta_raw.grad
                 eta_grad_norm = eta_grad.norm().item() if eta_grad is not None else 0.0
                 metrics = {}
-                # psi_state already computed above
                 metrics["objective/kl_ref_weighted"] = (
                     self.accelerator.gather_for_metrics(kl_weighted_post).mean().item()
                 )
