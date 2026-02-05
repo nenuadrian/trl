@@ -490,7 +490,6 @@ def batch_generation(
     return padded_query_responses, padded_logitss
 
 
-@torch.no_grad()
 def get_value_only(value_model, input_ids, attention_mask):
     outputs = value_model(
         input_ids=input_ids,
@@ -802,6 +801,8 @@ class VMPOTrainer(BaseTrainer):
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
+        self.value_model.config.pad_token_id = processing_class.pad_token_id
+        self.value_model.config.eos_token_id = processing_class.eos_token_id
         if hasattr(self.value_model, "gradient_checkpointing_enable"):
             self.value_model.gradient_checkpointing_enable()
         self.data_collator = data_collator
@@ -1201,11 +1202,12 @@ class VMPOTrainer(BaseTrainer):
                     )
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     attention_mask = query_response != processing_class.pad_token_id
-                    value_full = get_value_only(
-                        unwrapped_value_model,
-                        query_response,
-                        attention_mask,
-                    )
+                    with torch.no_grad():
+                        value_full = get_value_only(
+                            unwrapped_value_model,
+                            query_response,
+                            attention_mask,
+                        )
                     value = value_full[:, context_length - 1 : -1]
                     del value_full
                     torch.cuda.empty_cache()
