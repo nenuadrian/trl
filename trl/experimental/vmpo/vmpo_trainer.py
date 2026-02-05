@@ -490,6 +490,17 @@ def batch_generation(
     return padded_query_responses, padded_logitss
 
 
+@torch.no_grad()
+def get_value_only(value_model, input_ids, attention_mask):
+    outputs = value_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    return outputs.logits.squeeze(-1)
+
+
 def exact_div(a, b, custom_error_message=""):
     q = a // b
     if a != q * b:
@@ -791,6 +802,8 @@ class VMPOTrainer(BaseTrainer):
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
+        if hasattr(self.value_model, "gradient_checkpointing_enable"):
+            self.value_model.gradient_checkpointing_enable()
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
@@ -1187,13 +1200,15 @@ class VMPOTrainer(BaseTrainer):
                         - 1
                     )
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                    full_value, _, _ = get_reward(
+                    attention_mask = query_response != processing_class.pad_token_id
+                    value_full = get_value_only(
                         unwrapped_value_model,
                         query_response,
-                        processing_class.pad_token_id,
-                        context_length,
+                        attention_mask,
                     )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    value = value_full[:, context_length - 1 : -1]
+                    del value_full
+                    torch.cuda.empty_cache()
                     _, score, _ = get_reward(
                         reward_model,
                         postprocessed_query_response,
@@ -1216,7 +1231,7 @@ class VMPOTrainer(BaseTrainer):
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
                 rollout_logits = torch.cat(rollout_logits, 0)
-                del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
+                del (logprob, ref_logprob, value, score, unwrapped_model)
                 empty_cache()
                 gc.collect()
 
@@ -1364,13 +1379,15 @@ class VMPOTrainer(BaseTrainer):
                     else:
                         policy_loss = torch.zeros((), device=device)
 
-                    value_full, _, _ = get_reward(
+                    attention_mask = mb_query_response != processing_class.pad_token_id
+                    value_pred_full = get_value_only(
                         self.accelerator.unwrap_model(model).value_model,
                         mb_query_response,
-                        processing_class.pad_token_id,
-                        context_length,
+                        attention_mask,
                     )
-                    value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
+                    value_pred = value_pred_full[:, context_length - 1 : -1]
+                    del value_pred_full
+                    torch.cuda.empty_cache()
                     value_mask = ~padding_mask_p1[mini_batch_inds]
                     with torch.no_grad():
                         value_old_mb = values[mini_batch_inds]
