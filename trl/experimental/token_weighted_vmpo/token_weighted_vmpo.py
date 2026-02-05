@@ -672,6 +672,9 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
+        if self.value_model is not None:
+            for p in self.value_model.parameters():
+                p.requires_grad_(False)
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
@@ -958,12 +961,13 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     torch.full_like(pad_idx, postprocessed_response.shape[1] - 1),
                 )
                 unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                full_value, _, _ = get_reward(
-                    unwrapped_value_model,
-                    query_response,
-                    processing_class.pad_token_id,
-                    context_length,
-                )
+                with torch.no_grad():
+                    full_value, _, _ = get_reward(
+                        unwrapped_value_model,
+                        query_response,
+                        processing_class.pad_token_id,
+                        context_length,
+                    )
                 value = full_value[:, context_length - 1 : -1].squeeze(-1)
                 _, score, _ = get_reward(
                     reward_model,
@@ -1185,13 +1189,8 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             else:
                 policy_loss = torch.zeros((), device=self.accelerator.device)
 
-            value_full, _, _ = get_reward(
-                self.accelerator.unwrap_model(self.model).value_model,
-                mb_query_response,
-                self.processing_class.pad_token_id,
-                context_length,
-            )
-            value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
+            # Use cached rollout values for critic predictions (no recompute)
+            value_pred = values[mb_inds]
             value_mask = mask_valid_mb
             with torch.no_grad():
                 value_old_mb = values[mb_inds]
