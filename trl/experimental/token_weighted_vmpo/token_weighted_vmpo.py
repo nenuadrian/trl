@@ -72,7 +72,7 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         metadata={"help": "Minimum value added after softplus to keep η positive."},
     )
     eta_inner_steps: int = field(
-        default=10,
+        default=30,
         metadata={
             "help": "Number of inner optimization steps for the temperature dual variable η."
         },
@@ -90,7 +90,7 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         metadata={"help": "Minimum value added after softplus to keep α positive."},
     )
     psi_topk_ratio: float | None = field(
-        default=None,
+        default=0.1,
         metadata={
             "help": "Optional top-k truncation ratio for token-level ψ support (e.g., 0.2 keeps top 20% tokens by advantage). "
             "Set to None to disable."
@@ -115,7 +115,7 @@ class TokenWeightedVMPOTrainerConfig(TrainingArguments):
         },
     )
     eta_lr_mult: float = field(
-        default=0.1,
+        default=1.0,
         metadata={
             "help": "Learning-rate multiplier for η dual optimizer relative to policy learning rate."
         },
@@ -1005,7 +1005,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
 
             # Center rewards before advantage computation (critical for V-MPO ψ)
             reward_mean_raw = scores.mean()
-            scores = scores - reward_mean_raw
+            # Keep scores raw; only advantages will be centered later.
 
             # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
             response_idxs = torch.arange(
@@ -1145,8 +1145,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         kl_weighted_max_tok_accum: torch.Tensor,
         approxkl_stats: torch.Tensor,  # write per-minibatch KL here
         approxkl_scale: float = 1.0,  # e.g. 1/m_steps to average across M-steps
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list, list]:
-        kl_vals_last_mstep: list[torch.Tensor] = []
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list, list, list]:
         b_inds = np.random.permutation(self.args.local_batch_size)
 
         mini_batch_idx = 0  # index into approxkl_stats along the minibatch dimension
@@ -1255,7 +1254,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             )
             pg_losses.append(policy_loss.detach())
             vf_losses.append(value_loss.detach())
-            kl_vals_last_mstep.append(kl_mean_mb.detach())
 
             mini_batch_idx += 1
 
@@ -1273,7 +1271,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             kl_weighted_max_tok_accum,
             pg_losses,
             vf_losses,
-            kl_vals_last_mstep,
             entropy_stats,
         )
 
@@ -1430,7 +1427,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             kl_weighted_num_accum = torch.zeros((), device=device)
             kl_weighted_den_accum = torch.zeros((), device=device)
             kl_weighted_max_tok_accum = torch.tensor(float("-inf"), device=device)
-            pg_losses, vf_losses, kl_vals_last_mstep, entropy_stats = [], [], [], []
+            pg_losses, vf_losses, entropy_stats = [], [], [], []
 
             for _ in range(self.args.m_steps):
                 (
@@ -1439,7 +1436,6 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                     kl_weighted_max_tok_accum,
                     pg_losses,
                     vf_losses,
-                    kl_vals_last_mstep,
                     entropy_stats,
                 ) = self._m_step(
                     psi_global=psi_global,
@@ -1558,15 +1554,15 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
         raw_advantages: torch.Tensor,
         device: torch.device,
     ) -> tuple[torch.Tensor, list]:
-        # ψ must be normalized per sequence: ∀i, sum_t ψ[i,t] = 1 over valid tokens (optionally top-k truncated)
+        # ψ must be normalized globally across all selected tokens (optional per-sequence top-k support).
         mask_valid = ~padding_mask_p1  # [B, T]
-        A = raw_advantages  # [B, T]
+        A = raw_advantages
         psi_global = torch.zeros_like(A)
         l_eta_full_values: list[torch.Tensor] = []
 
-        # Precompute per-sequence valid positions and (centered) advantages + top-k selection
         per_seq = []
         B = A.shape[0]
+        total_valid_tokens = int(mask_valid.sum().item())
 
         for i in range(B):
             mask_i = mask_valid[i]
@@ -1589,84 +1585,70 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
                 mask_topk_i = A_i >= thresh_i
 
             A_sel_i = A_i[mask_topk_i]
-            n_sel_i = int(A_sel_i.numel())
-            if n_sel_i == 0:
+            if int(A_sel_i.numel()) == 0:
                 per_seq.append(None)
                 continue
 
-            # Token positions (in original T dimension) corresponding to the selected set
             pos_sel_i = pos_i[mask_topk_i]
+            per_seq.append({"pos_sel": pos_sel_i, "A_sel": A_sel_i})
 
-            # Compensate eps_eta per sequence when truncating support
-            eff_eps_eta_i = float(self.args.eps_eta) + math.log(n_tok_i / n_sel_i)
+        global_pos_b, global_pos_t, global_A_sel = [], [], []
+        for i, item in enumerate(per_seq):
+            if item is None:
+                continue
+            pos_sel = item["pos_sel"]
+            A_sel = item["A_sel"]
+            global_pos_b.append(torch.full_like(pos_sel, i))
+            global_pos_t.append(pos_sel)
+            global_A_sel.append(A_sel)
 
-            per_seq.append(
-                {
-                    "pos_sel": pos_sel_i,
-                    "A_sel": A_sel_i,
-                    "n_sel": n_sel_i,
-                    "eff_eps_eta": eff_eps_eta_i,
-                }
-            )
+        if len(global_A_sel) == 0:
+            return psi_global, l_eta_full_values
 
-        # Helper: clamp only for exponentiation/log-mean-exp stability (do NOT affect top-k selection)
+        global_pos_b = torch.cat(global_pos_b)
+        global_pos_t = torch.cat(global_pos_t)
+        A_sel_all = torch.cat(global_A_sel)
+        n_sel_total = int(A_sel_all.numel())
+
+        eff_eps_eta = float(self.args.eps_eta)
+        if (
+            total_valid_tokens > 0
+            and n_sel_total > 0
+            and total_valid_tokens != n_sel_total
+        ):
+            eff_eps_eta += math.log(total_valid_tokens / n_sel_total)
+
         def _clip_for_exp(x: torch.Tensor) -> torch.Tensor:
             clip = self.args.advantage_clip
             return x.clamp(min=-clip, max=clip) if clip is not None else x
 
-        # η dual update (global η, but objective is averaged over sequences)
         for _ in range(self.args.eta_inner_steps):
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-            l_eta_terms = []
-
-            for item in per_seq:
-                if item is None:
-                    continue
-                A_sel = item["A_sel"]
-                n_sel = item["n_sel"]
-                eff_eps_eta = item["eff_eps_eta"]
-
-                A_sel_exp = _clip_for_exp(A_sel)
-                A_max = A_sel_exp.max()
-                weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
-                Z = weights.sum().clamp_min(1e-8)
-
-                log_mean_exp = torch.log(Z) + (A_max / (eta + 1e-8)) - math.log(n_sel)
-                l_eta_terms.append(eta * (eff_eps_eta + log_mean_exp))
-
-            if len(l_eta_terms) == 0:
-                break
-
-            l_eta = torch.stack(l_eta_terms).mean()
+            A_sel_exp = _clip_for_exp(A_sel_all)
+            A_max = A_sel_exp.max()
+            weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
+            log_mean_exp = (
+                torch.log(weights.sum().clamp_min(1e-8))
+                + (A_max / (eta + 1e-8))
+                - math.log(n_sel_total)
+            )
+            l_eta = eta * (eff_eps_eta + log_mean_exp)
             self.eta_optimizer.zero_grad()
             l_eta.backward()
             self.eta_optimizer.step()
             l_eta_full_values.append(l_eta.detach())
 
-        # Construct ψ with final η, normalized per sequence (scatter back into [B, T])
         with torch.no_grad():
             eta = F.softplus(self.model.eta_raw) + self.args.eta_min
-            for i, item in enumerate(per_seq):
-                if item is None:
-                    continue
-                pos_sel = item["pos_sel"]
-                A_sel = item["A_sel"]
+            A_sel_exp = _clip_for_exp(A_sel_all)
+            A_max = A_sel_exp.max()
+            weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
+            Z = weights.sum().clamp_min(1e-8)
+            psi_flat = weights / Z
+            eps = 0.01
+            psi_flat = (1 - eps) * psi_flat + eps / float(n_sel_total)
 
-                A_sel_exp = _clip_for_exp(A_sel)
-                A_max = A_sel_exp.max()
-                weights = torch.exp((A_sel_exp - A_max) / (eta + 1e-8))
-                Z = weights.sum().clamp_min(1e-8)
-                psi_sel = (
-                    weights / Z
-                )  # sums to 1 within this sequence's selected support
-
-                psi_global[i, pos_sel] = psi_sel
-
-                n_sel = pos_sel.numel()
-                eps = 0.01
-                psi_global[i, pos_sel] = (1 - eps) * psi_global[
-                    i, pos_sel
-                ] + eps / n_sel
+            psi_global[global_pos_b, global_pos_t] = psi_flat
 
         return psi_global, l_eta_full_values
 
