@@ -1427,7 +1427,7 @@ class TokenWeightedVMPOTrainer(BaseTrainer):
             kl_weighted_num_accum = torch.zeros((), device=device)
             kl_weighted_den_accum = torch.zeros((), device=device)
             kl_weighted_max_tok_accum = torch.tensor(float("-inf"), device=device)
-            pg_losses, vf_losses, entropy_stats = [], [], [], []
+            pg_losses, vf_losses, entropy_stats = [], [], []
 
             for _ in range(self.args.m_steps):
                 (
