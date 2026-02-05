@@ -795,6 +795,9 @@ class VMPOTrainer(BaseTrainer):
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
+        
+        value_model.gradient_checkpointing_enable()
+        reward_model.gradient_checkpointing_enable()
 
         #########
         # calculate various batch sizes
@@ -1326,6 +1329,8 @@ class VMPOTrainer(BaseTrainer):
             # Do multiple epochs of V-MPO training
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
             for vmpo_epoch_idx in range(args.num_vmpo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
