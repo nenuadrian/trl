@@ -1397,11 +1397,14 @@ class VMPOTrainer(BaseTrainer):
                         mask_valid_mb.sum(dim=1) + 1e-8
                     )
                     entropy_mean = (psi_state_mb * entropy_seq).sum()
-                    # VMPO needs ψ-weighted KL(old‖new) at the token level
-                    kl_tok_mb = (
+                    # VMPO needs ψ-weighted KL(old‖new): expectation under old rollout policy
+                    kl_terms_mb = (
                         logprobs[mini_batch_inds] - new_logprobs
                     ) * mask_valid_mb
-                    kl_weighted_mb = (psi_mb * kl_tok_mb).sum()
+                    kl_state_mb = kl_terms_mb.sum(dim=1) / (
+                        mask_valid_mb.sum(dim=1) + 1e-8
+                    )
+                    kl_weighted_mb = (psi_state_mb * kl_state_mb).sum()
                     alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
                     beta_entropy = args.beta_entropy * math.exp(
                         -args.beta_entropy_decay * (update - 1)
