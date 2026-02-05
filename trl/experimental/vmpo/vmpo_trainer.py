@@ -490,26 +490,6 @@ def batch_generation(
     return padded_query_responses, padded_logitss
 
 
-def get_value_only(value_model, input_ids, attention_mask):
-    outputs = value_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        return_dict=True,
-    )
-    logits = outputs.logits
-
-    if logits.dim() == 2:
-        # (B, T) → OK
-        return logits
-    elif logits.dim() == 3 and logits.size(-1) == 1:
-        # (B, T, 1) → (B, T)
-        return logits.squeeze(-1)
-    else:
-        raise ValueError(
-            f"Expected token-level value logits, got shape {logits.shape}"
-        )
-
-
 def exact_div(a, b, custom_error_message=""):
     q = a // b
     if a != q * b:
@@ -811,10 +791,6 @@ class VMPOTrainer(BaseTrainer):
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
         self.value_model = value_model
-        self.value_model.config.pad_token_id = processing_class.pad_token_id
-        self.value_model.config.eos_token_id = processing_class.eos_token_id
-        if hasattr(self.value_model, "gradient_checkpointing_enable"):
-            self.value_model.gradient_checkpointing_enable()
         self.data_collator = data_collator
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
@@ -1211,16 +1187,13 @@ class VMPOTrainer(BaseTrainer):
                         - 1
                     )
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
-                    attention_mask = query_response != processing_class.pad_token_id
-                    with torch.no_grad():
-                        value_full = get_value_only(
-                            unwrapped_value_model,
-                            query_response,
-                            attention_mask,
-                        )
-                    value = value_full[:, context_length - 1 : -1]
-                    del value_full
-                    torch.cuda.empty_cache()
+                    full_value, _, _ = get_reward(
+                        unwrapped_value_model,
+                        query_response,
+                        processing_class.pad_token_id,
+                        context_length,
+                    )
+                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
                     _, score, _ = get_reward(
                         reward_model,
                         postprocessed_query_response,
@@ -1243,7 +1216,7 @@ class VMPOTrainer(BaseTrainer):
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
                 rollout_logits = torch.cat(rollout_logits, 0)
-                del (logprob, ref_logprob, value, score, unwrapped_model)
+                del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 empty_cache()
                 gc.collect()
 
@@ -1325,7 +1298,7 @@ class VMPOTrainer(BaseTrainer):
             alpha = F.softplus(self.model.alpha_raw) + args.alpha_min
             # token-level ψ over all valid tokens
             mask_valid = ~padding_mask
-            A_valid = raw_advantages.detach()[mask_valid]
+            A_valid = raw_advantages[mask_valid]
             psi_global = torch.zeros_like(raw_advantages)
             l_eta = torch.zeros((), device=device)
             num_valid = A_valid.numel()
@@ -1342,7 +1315,7 @@ class VMPOTrainer(BaseTrainer):
 
                 A_max = A_kept.max()
                 weights = torch.zeros_like(A_valid)
-                weights[keep] = torch.exp((A_valid[keep] - A_max) / eta)
+                weights[keep] = torch.exp((A_kept - A_max) / (eta + 1e-8))
                 Z = weights.sum().clamp_min(1e-8)
                 psi_flat = weights / Z
                 psi_global[mask_valid] = psi_flat
@@ -1358,6 +1331,8 @@ class VMPOTrainer(BaseTrainer):
                 l_eta_full_values.append(l_eta.detach())
             # detach ψ before policy/value updates to avoid in-place versioning issues
             psi_global = psi_global.detach()
+            psi_state = psi_global.sum(dim=1)
+            psi_state = psi_state / psi_state.sum().clamp_min(1e-8)
             # Do multiple epochs of V-MPO training
             kl_weighted_accum = torch.zeros((), device=device)
             kl_mb_count = 0
@@ -1374,6 +1349,7 @@ class VMPOTrainer(BaseTrainer):
                     mb_response = responses[mini_batch_inds]
                     mb_query_response = torch.cat((mb_query, mb_response), 1)
                     psi_mb = psi_global[mini_batch_inds]
+                    psi_state_mb = psi_state[mini_batch_inds]
                     mask_valid_mb = ~padding_mask[mini_batch_inds]
 
                     policy_outputs = forward(
@@ -1391,15 +1367,13 @@ class VMPOTrainer(BaseTrainer):
                     else:
                         policy_loss = torch.zeros((), device=device)
 
-                    attention_mask = mb_query_response != processing_class.pad_token_id
-                    value_pred_full = get_value_only(
+                    value_full, _, _ = get_reward(
                         self.accelerator.unwrap_model(model).value_model,
                         mb_query_response,
-                        attention_mask,
+                        processing_class.pad_token_id,
+                        context_length,
                     )
-                    value_pred = value_pred_full[:, context_length - 1 : -1]
-                    del value_pred_full
-                    torch.cuda.empty_cache()
+                    value_pred = value_full[:, context_length - 1 : -1].squeeze(-1)
                     value_mask = ~padding_mask_p1[mini_batch_inds]
                     with torch.no_grad():
                         value_old_mb = values[mini_batch_inds]
@@ -1422,8 +1396,7 @@ class VMPOTrainer(BaseTrainer):
                     entropy_seq = (entropy * mask_valid_mb).sum(dim=1) / (
                         mask_valid_mb.sum(dim=1) + 1e-8
                     )
-                    entropy_tok = entropy * mask_valid_mb
-                    entropy_mean = (psi_mb * entropy_tok).sum()
+                    entropy_mean = (psi_state_mb * entropy_seq).sum()
                     # VMPO needs ψ-weighted KL(old‖new) at the token level
                     kl_tok_mb = (
                         logprobs[mini_batch_inds] - new_logprobs
@@ -1481,6 +1454,7 @@ class VMPOTrainer(BaseTrainer):
                 eta_grad = self.model.eta_raw.grad
                 eta_grad_norm = eta_grad.norm().item() if eta_grad is not None else 0.0
                 metrics = {}
+                # psi_state already computed above
                 metrics["objective/kl_ref_weighted"] = (
                     self.accelerator.gather_for_metrics(kl_weighted_post).mean().item()
                 )
