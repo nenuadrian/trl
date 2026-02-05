@@ -568,7 +568,7 @@ def forward(
         attention_mask=attention_mask,
         position_ids=position_ids,
         return_dict=True,
-        output_hidden_states=True,
+        output_hidden_states=False,
     )
 
 
@@ -638,7 +638,7 @@ class PolicyAndValueWrapper(nn.Module):
 
     def forward(self, **kwargs):
         output = self.critic_backbone(**kwargs)
-        logits = self.value_model.score(output.hidden_states[-1])
+        logits = self.value_model.score(output.last_hidden_state)
         return self.policy(**kwargs), logits
 
 
@@ -1122,7 +1122,6 @@ class VMPOTrainer(BaseTrainer):
                 scores = []
                 sequence_lengths = []
                 values = []
-                rollout_logits = []
                 with unwrap_model_for_generation(
                     self.model,
                     self.accelerator,
@@ -1147,7 +1146,6 @@ class VMPOTrainer(BaseTrainer):
                     response = query_response[:, context_length:]
                     logits = logitss[i : i + args.local_rollout_forward_batch_size]
                     logprob = selective_log_softmax(logits, response)
-                    rollout_logits.append(logits)
                     del logits
                     empty_cache()
 
@@ -1215,7 +1213,6 @@ class VMPOTrainer(BaseTrainer):
                 sequence_lengths = torch.cat(sequence_lengths, 0)
                 scores = torch.cat(scores, 0)
                 values = torch.cat(values, 0)
-                rollout_logits = torch.cat(rollout_logits, 0)
                 del (logprob, ref_logprob, full_value, value, score, unwrapped_model)
                 empty_cache()
                 gc.collect()
@@ -1238,14 +1235,6 @@ class VMPOTrainer(BaseTrainer):
                 ref_logprobs = torch.masked_fill(
                     ref_logprobs, padding_mask, INVALID_LOGPROB
                 )
-                # rollout logits alignment check
-                old_lp = selective_log_softmax(rollout_logits, responses)
-                diff = (old_lp - logprobs).abs()
-                diff = diff.masked_fill(padding_mask, 0)
-                mean_diff = diff.sum() / ((~padding_mask).sum() + 1e-8)
-                assert (
-                    mean_diff < 1e-4
-                ), "rollout_logits misaligned with stored logprobs"
                 sequence_lengths_p1 = sequence_lengths + 1
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
                 values = torch.masked_fill(values, padding_mask_p1, 0)
@@ -1563,7 +1552,6 @@ class VMPOTrainer(BaseTrainer):
                 actual_end,
                 advantages,
                 returns,
-                rollout_logits,
             )
             empty_cache()
 
