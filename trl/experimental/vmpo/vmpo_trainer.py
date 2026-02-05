@@ -494,10 +494,20 @@ def get_value_only(value_model, input_ids, attention_mask):
     outputs = value_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        output_hidden_states=False,
         return_dict=True,
     )
-    return outputs.logits.squeeze(-1)
+    logits = outputs.logits
+
+    if logits.dim() == 2:
+        # (B, T) → OK
+        return logits
+    elif logits.dim() == 3 and logits.size(-1) == 1:
+        # (B, T, 1) → (B, T)
+        return logits.squeeze(-1)
+    else:
+        raise ValueError(
+            f"Expected token-level value logits, got shape {logits.shape}"
+        )
 
 
 def exact_div(a, b, custom_error_message=""):
