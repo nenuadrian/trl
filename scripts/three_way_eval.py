@@ -135,6 +135,40 @@ def pairwise_stats(a: np.ndarray, b: np.ndarray):
     return wins, ties, margin
 
 
+def _bootstrap_ci_from_samples(samples: np.ndarray, ci_level: float):
+    alpha = (1.0 - ci_level) / 2.0
+    lo = float(np.quantile(samples, alpha))
+    hi = float(np.quantile(samples, 1.0 - alpha))
+    return lo, hi
+
+
+def bootstrap_mean_ci(values: np.ndarray, n_boot: int, ci_level: float, rng):
+    n = len(values)
+    if n == 0:
+        return float("nan"), float("nan")
+    idx = rng.integers(0, n, size=(n_boot, n))
+    stats = values[idx].mean(axis=1)
+    return _bootstrap_ci_from_samples(stats, ci_level)
+
+
+def bootstrap_pairwise_ci(a: np.ndarray, b: np.ndarray, n_boot: int, ci_level: float, rng):
+    if len(a) != len(b):
+        raise ValueError("Pairwise bootstrap requires arrays with equal length.")
+    n = len(a)
+    if n == 0:
+        return (float("nan"), float("nan")), (float("nan"), float("nan"))
+    idx = rng.integers(0, n, size=(n_boot, n))
+    a_bs = a[idx]
+    b_bs = b[idx]
+    diff = a_bs - b_bs
+    margin_stats = diff.mean(axis=1)
+    win_stats = (diff > 0).mean(axis=1)
+    return (
+        _bootstrap_ci_from_samples(win_stats, ci_level),
+        _bootstrap_ci_from_samples(margin_stats, ci_level),
+    )
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -152,11 +186,18 @@ def main():
     p.add_argument("--max_new_tokens", type=int, default=64)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--bootstrap_iters", type=int, default=2000)
+    p.add_argument("--ci_level", type=float, default=0.95)
     args = p.parse_args()
 
     set_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    if not (0 < args.ci_level < 1):
+        raise ValueError("--ci_level must be between 0 and 1.")
+    if args.bootstrap_iters < 0:
+        raise ValueError("--bootstrap_iters must be >= 0.")
 
     ckpts = [parse_ckpt_arg(x) for x in args.ckpt]
     if len(ckpts) < 2:
@@ -223,9 +264,16 @@ def main():
 
     print("\n=== Per-model reward stats ===")
     for r in results:
+        if args.bootstrap_iters > 0:
+            ci_lo, ci_hi = bootstrap_mean_ci(
+                r.rewards, args.bootstrap_iters, args.ci_level, rng
+            )
+            ci_text = f" | mean_ci=[{ci_lo: .4f}, {ci_hi: .4f}]"
+        else:
+            ci_text = ""
         print(
             f"{r.name:>12} | mean={r.rewards.mean(): .4f} | std={r.rewards.std(): .4f} | "
-            f"min={r.rewards.min(): .4f} | max={r.rewards.max(): .4f}"
+            f"min={r.rewards.min(): .4f} | max={r.rewards.max(): .4f}{ci_text}"
         )
 
     print("\n=== Pairwise win rates (reward-based) ===")
@@ -233,8 +281,18 @@ def main():
         for j in range(i + 1, len(results)):
             a, b = results[i], results[j]
             win, tie, margin = pairwise_stats(a.rewards, b.rewards)
+            if args.bootstrap_iters > 0:
+                win_ci, margin_ci = bootstrap_pairwise_ci(
+                    a.rewards, b.rewards, args.bootstrap_iters, args.ci_level, rng
+                )
+                ci_text = (
+                    f" | win_ci=[{win_ci[0]:.3f}, {win_ci[1]:.3f}]"
+                    f" | margin_ci=[{margin_ci[0]:.4f}, {margin_ci[1]:.4f}]"
+                )
+            else:
+                ci_text = ""
             print(
-                f"{a.name:>12} vs {b.name:<12} | win_rate={win:.3f} | tie_rate={tie:.3f} | mean_margin={margin:.4f}"
+                f"{a.name:>12} vs {b.name:<12} | win_rate={win:.3f} | tie_rate={tie:.3f} | mean_margin={margin:.4f}{ci_text}"
             )
 
 
