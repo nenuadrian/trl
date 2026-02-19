@@ -32,10 +32,64 @@ def batched(xs, bs):
         yield xs[i : i + bs]
 
 
+def _content_to_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if text is not None:
+                    chunks.append(str(text))
+            elif isinstance(item, str):
+                chunks.append(item)
+            else:
+                chunks.append(str(item))
+        return "".join(chunks)
+    return str(content)
+
+
+def prompt_to_text(prompt, tokenizer):
+    if isinstance(prompt, str):
+        return prompt
+
+    if isinstance(prompt, list):
+        if hasattr(tokenizer, "apply_chat_template"):
+            try:
+                return tokenizer.apply_chat_template(
+                    prompt,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+
+        lines = []
+        for msg in prompt:
+            if isinstance(msg, dict):
+                role = msg.get("role", "")
+                content = _content_to_text(msg.get("content", ""))
+                lines.append(f"{role}: {content}" if role else content)
+            else:
+                lines.append(str(msg))
+        return "\n".join(lines)
+
+    if isinstance(prompt, dict):
+        if isinstance(prompt.get("prompt"), str):
+            return prompt["prompt"]
+        if isinstance(prompt.get("messages"), list):
+            return prompt_to_text(prompt["messages"], tokenizer)
+        return str(prompt)
+
+    return str(prompt)
+
+
 @torch.inference_mode()
 def generate_completions(model, tokenizer, prompts, device, max_new_tokens, batch_size):
     out_text = []
     for batch_prompts in batched(prompts, batch_size):
+        batch_prompts = [prompt_to_text(p, tokenizer) for p in batch_prompts]
         tok = tokenizer(
             batch_prompts,
             return_tensors="pt",
@@ -58,7 +112,8 @@ def generate_completions(model, tokenizer, prompts, device, max_new_tokens, batc
 def score_with_reward_model(
     reward_model, reward_tokenizer, prompts, completions, device, batch_size
 ):
-    texts = [p + c for p, c in zip(prompts, completions, strict=True)]
+    prompt_texts = [prompt_to_text(p, reward_tokenizer) for p in prompts]
+    texts = [p + c for p, c in zip(prompt_texts, completions, strict=True)]
     scores = []
     for batch_texts in batched(texts, batch_size):
         tok = reward_tokenizer(
@@ -123,10 +178,6 @@ def main():
 
     if len(prompts) == 0:
         raise ValueError("No prompts found.")
-    if not isinstance(prompts[0], str):
-        raise ValueError(
-            "This minimal script expects string prompts (e.g., standard_prompt_only)."
-        )
 
     reward_tok = AutoTokenizer.from_pretrained(args.reward_model)
     if reward_tok.pad_token_id is None:
