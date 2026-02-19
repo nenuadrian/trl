@@ -107,8 +107,20 @@ def main():
     if len(ckpts) < 2:
         raise ValueError("Provide at least 2 --ckpt entries.")
 
+    from trl import maybe_extract_prompt
+
     ds = load_dataset(args.dataset_name, name=args.dataset_config, split=args.split)
-    prompts = ds[args.prompt_column][: args.max_samples]
+
+    if args.prompt_column in ds.column_names:
+        prompts = ds[args.prompt_column][: args.max_samples]
+    elif "chosen" in ds.column_names and "rejected" in ds.column_names:
+        ds = ds.map(maybe_extract_prompt, desc="Extracting prompts for eval")
+        prompts = ds["prompt"][: args.max_samples]
+    else:
+        raise ValueError(f"No prompt-like column. Columns: {ds.column_names}")
+
+    print(f"Evaluating on {len(prompts)} prompts")
+
     if len(prompts) == 0:
         raise ValueError("No prompts found.")
     if not isinstance(prompts[0], str):
