@@ -25,6 +25,8 @@ _import_structure = {
         "SyncRefModelCallback",
         "WeaveCallback",
     ],
+    "dar_config": ["DARConfig"],
+    "dar_trainer": ["DARTrainer"],
     "dpo_config": [
         "DPOConfig",
         "FDivergenceConstants",  # deprecated import
@@ -61,6 +63,8 @@ if TYPE_CHECKING:
         SyncRefModelCallback,
         WeaveCallback,
     )
+    from .dar_config import DARConfig
+    from .dar_trainer import DARTrainer
     from .dpo_config import (
         DPOConfig,
         FDivergenceConstants,  # deprecated import

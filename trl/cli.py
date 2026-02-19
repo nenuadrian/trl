@@ -19,6 +19,7 @@ import sys
 
 from accelerate.commands.launch import launch_command, launch_command_parser
 
+from .scripts.dar import make_parser as make_dar_parser
 from .scripts.dpo import make_parser as make_dpo_parser
 from .scripts.env import print_env
 from .scripts.grpo import make_parser as make_grpo_parser
@@ -47,6 +48,7 @@ def main():
     subparsers = parser.add_subparsers(help="available commands", dest="command", parser_class=TrlParser)
 
     # Add the subparsers for every script
+    make_dar_parser(subparsers)
     make_dpo_parser(subparsers)
     subparsers.add_parser("env", help="Print the environment information")
     make_grpo_parser(subparsers)
@@ -88,7 +90,11 @@ def main():
         # Insert '--config_file' and the absolute path to the front of the list
         launch_args = ["--config_file", str(accelerate_config_path)] + launch_args
 
-    if args.command == "dpo":
+    if args.command == "dar":
+        # This simulates running: `accelerate launch <launch args> dar.py <training script args>`.
+        _launch_training_script("dar.py", launch_args, sys.argv[2:])  # remove "trl" and "dar"
+
+    elif args.command == "dpo":
         # This simulates running: `accelerate launch <launch args> dpo.py <training script args>`.
         _launch_training_script("dpo.py", launch_args, sys.argv[2:])  # remove "trl" and "dpo"
 

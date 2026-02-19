@@ -48,6 +48,8 @@ _import_structure = {
     "scripts": ["DatasetMixtureConfig", "ScriptArguments", "TrlParser", "get_dataset", "init_zero_verbose"],
     "trainer": [
         "BEMACallback",
+        "DARConfig",
+        "DARTrainer",
         "DPOConfig",
         "DPOTrainer",
         "FDivergenceConstants",  # deprecated import
@@ -96,6 +98,8 @@ if TYPE_CHECKING:
     from .scripts import DatasetMixtureConfig, ScriptArguments, TrlParser, get_dataset, init_zero_verbose
     from .trainer import (
         BEMACallback,
+        DARConfig,
+        DARTrainer,
         DPOConfig,
         DPOTrainer,
         FDivergenceConstants,  # deprecated import
