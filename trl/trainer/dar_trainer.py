@@ -187,6 +187,15 @@ class DARTrainer(DPOTrainer):
         self.reward_processing_class = reward_processing_class
 
         if self.reward_model is not None:
+            if self.reward_processing_class is None:
+                raise ValueError(
+                    "A reward processing class is required when using `reward_model`. "
+                    "Please provide `reward_processing_class` or ensure it can be auto-loaded."
+                )
+            # Sequence-classification heads rely on `config.pad_token_id` to identify the final non-pad token.
+            # Without this, batched reward scoring raises:
+            # "Cannot handle batch sizes > 1 if no padding token is defined."
+            self.reward_model.config.pad_token_id = self.reward_processing_class.pad_token_id
             self.reward_model.eval()
             for param in self.reward_model.parameters():
                 param.requires_grad_(False)
