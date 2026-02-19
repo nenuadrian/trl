@@ -193,6 +193,8 @@ def main():
         tok = AutoTokenizer.from_pretrained(path)
         if tok.pad_token_id is None:
             tok.pad_token = tok.eos_token
+        # Decoder-only generation should use left padding.
+        tok.padding_side = "left"
 
         model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype).to(device)
         model.eval()
