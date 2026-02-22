@@ -44,6 +44,8 @@ _import_structure = {
     "rloo_trainer": ["RLOOTrainer"],
     "sft_config": ["SFTConfig"],
     "sft_trainer": ["SFTTrainer"],
+    "vmpo_config": ["VMPOConfig"],
+    "vmpo_trainer": ["VMPOTrainer"],
     "utils": [
         "RunningMoments",
         "disable_dropout_in_model",
@@ -82,6 +84,8 @@ if TYPE_CHECKING:
     from .rloo_trainer import RLOOTrainer
     from .sft_config import SFTConfig
     from .sft_trainer import SFTTrainer
+    from .vmpo_config import VMPOConfig
+    from .vmpo_trainer import VMPOTrainer
     from .utils import (
         RunningMoments,
         disable_dropout_in_model,
