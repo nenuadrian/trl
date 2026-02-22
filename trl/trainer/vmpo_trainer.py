@@ -62,7 +62,7 @@ class _SyncOldPolicyModelCallback(TrainerCallback):
 
 class VMPOTrainer(DARTrainer):
     """
-    Value Maximum a Posteriori Policy Optimization (VMPO) trainer.
+    Variational Maximum a Posteriori Policy Optimization (VMPO) trainer.
 
     This trainer reuses DAR's prompt/completion/reward pipeline and swaps the objective for
     VMPO-style updates:
@@ -202,6 +202,41 @@ class VMPOTrainer(DARTrainer):
         else:
             self._vmpo_alpha = self._project_positive(self._vmpo_alpha, self.args.vmpo_min_alpha)
 
+    def _generate_k_responses_from_model(
+        self, generation_model: PreTrainedModel | nn.Module, prompts_batch: dict[str, Any], k: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        prompt_input_ids = prompts_batch["prompt_input_ids"]
+        prompt_attention_mask = prompts_batch["prompt_attention_mask"]
+
+        generation_kwargs = {
+            "do_sample": True,
+            "max_new_tokens": self.args.max_new_tokens,
+            "temperature": self.args.temperature,
+            "top_p": self.args.top_p,
+            "top_k": self.args.top_k,
+            "repetition_penalty": self.args.repetition_penalty,
+            "num_return_sequences": k,
+            "pad_token_id": self.pad_token_id,
+        }
+        if self.args.min_p is not None:
+            generation_kwargs["min_p"] = self.args.min_p
+
+        gen_context_manager = (
+            autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+        )
+        with torch.no_grad(), gen_context_manager:
+            generated = generation_model.generate(
+                input_ids=prompt_input_ids,
+                attention_mask=prompt_attention_mask,
+                **generation_kwargs,
+            )
+
+        completion_input_ids = generated[:, prompt_input_ids.size(1) :]
+        completion_attention_mask = (completion_input_ids != self.pad_token_id).long()
+        prompt_input_ids_rep = prompt_input_ids.repeat_interleave(k, dim=0)
+        prompt_attention_mask_rep = prompt_attention_mask.repeat_interleave(k, dim=0)
+        return prompt_input_ids_rep, prompt_attention_mask_rep, completion_input_ids, completion_attention_mask
+
     def get_batch_loss_metrics(
         self,
         model: PreTrainedModel | nn.Module,
@@ -224,12 +259,15 @@ class VMPOTrainer(DARTrainer):
             prompt_attention_mask_rep = prompt_attention_mask.repeat_interleave(k, dim=0)
         else:
             k = self.args.vmpo_k
+            generation_model = self.model
+            if train_eval == "train" and self._uses_old_policy_estimator and self.old_policy_model is not None:
+                generation_model = self.old_policy_model
             (
                 prompt_input_ids_rep,
                 prompt_attention_mask_rep,
                 completion_input_ids,
                 completion_attention_mask,
-            ) = self.generate_k_responses(batch, k)
+            ) = self._generate_k_responses_from_model(generation_model, batch, k)
             rewards_flat = None
             behavior_logps_flat = None
 
@@ -286,6 +324,22 @@ class VMPOTrainer(DARTrainer):
                         completion_attention_mask,
                     )
 
+        old_policy_logps = None
+        if self._uses_old_policy_estimator:
+            if self.old_policy_model is None:
+                raise ValueError("`old_policy_model` is not initialized while using an old-policy KL estimator.")
+            old_policy_context = (
+                autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+            )
+            with torch.no_grad(), old_policy_context:
+                old_policy_logps = self._compute_sequence_logps(
+                    self.old_policy_model,
+                    prompt_input_ids_rep,
+                    prompt_attention_mask_rep,
+                    completion_input_ids,
+                    completion_attention_mask,
+                )
+
         rewards = rewards_flat.view(batch_size, k)
         centered_advantages = rewards - rewards.mean(dim=1, keepdim=True)
         normalized_advantages = self._normalize_advantages(centered_advantages)
@@ -304,8 +358,18 @@ class VMPOTrainer(DARTrainer):
         else:
             eta_loss = float(self._eta_dual_loss(top_advantages.detach(), eta_value).detach().item())
 
-        if self.args.vmpo_kl_estimator == "behavior" and behavior_logps_flat is not None:
+        ref_anchor_loss = policy_logps.new_zeros(())
+        if self.args.vmpo_kl_estimator == "behavior":
+            if behavior_logps_flat is None:
+                behavior_logps_flat = policy_logps.detach()
             kl_values = behavior_logps_flat - policy_logps
+        elif self.args.vmpo_kl_estimator == "old_policy":
+            kl_values = old_policy_logps - policy_logps
+        elif self.args.vmpo_kl_estimator == "old_policy_ref":
+            kl_values = old_policy_logps - policy_logps
+            if not self.reference_free:
+                ref_anchor_values = policy_logps - ref_logps
+                ref_anchor_loss = self.args.alpha * ref_anchor_values.mean()
         elif self.reference_free:
             kl_values = torch.zeros_like(policy_logps)
         else:
@@ -314,7 +378,7 @@ class VMPOTrainer(DARTrainer):
 
         alpha_value = self._vmpo_alpha
         kl_loss = policy_logps.new_tensor(alpha_value) * kl_mean
-        loss = policy_loss + kl_loss
+        loss = policy_loss + kl_loss + ref_anchor_loss
 
         if train_eval == "train":
             self._update_alpha_dual(kl_mean)
@@ -326,9 +390,13 @@ class VMPOTrainer(DARTrainer):
         gathered_weights = self.accelerator.gather_for_metrics(e_step_weights.detach())
         gathered_policy = self.accelerator.gather_for_metrics(policy_logps.detach())
         gathered_ref = self.accelerator.gather_for_metrics(ref_logps.detach())
+        gathered_old = (
+            self.accelerator.gather_for_metrics(old_policy_logps.detach()) if old_policy_logps is not None else None
+        )
         gathered_kl = self.accelerator.gather_for_metrics(kl_values.detach())
         gathered_policy_loss = self.accelerator.gather_for_metrics(policy_loss.detach())
         gathered_kl_loss = self.accelerator.gather_for_metrics(kl_loss.detach())
+        gathered_ref_anchor_loss = self.accelerator.gather_for_metrics(ref_anchor_loss.detach())
         gathered_losses = self.accelerator.gather_for_metrics(loss.detach())
 
         positive_weights = gathered_weights[gathered_weights > 0]
@@ -352,8 +420,10 @@ class VMPOTrainer(DARTrainer):
             f"{prefix}vmpo/kl_mean": gathered_kl.mean().item(),
             f"{prefix}vmpo/logps_policy": gathered_policy.mean().item(),
             f"{prefix}vmpo/logps_ref": gathered_ref.mean().item(),
+            f"{prefix}vmpo/logps_old": gathered_old.mean().item() if gathered_old is not None else 0.0,
             f"{prefix}vmpo/policy_loss": gathered_policy_loss.mean().item(),
             f"{prefix}vmpo/kl_loss": gathered_kl_loss.mean().item(),
+            f"{prefix}vmpo/ref_anchor_loss": gathered_ref_anchor_loss.mean().item(),
             f"{prefix}vmpo/loss": gathered_losses.mean().item(),
         }
 

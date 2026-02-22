@@ -73,3 +73,27 @@ class TestVMPOTrainer(TrlTestCase):
         trainer.train()
 
         assert trainer.state.log_history[-1]["train_loss"] is not None
+
+    def test_train_offline_with_old_policy_kl(self):
+        dataset = load_dataset("trl-internal-testing/zen", "standard_preference", split="train[:4]")
+        training_args = VMPOConfig(
+            output_dir=self.tmp_dir,
+            per_device_train_batch_size=2,
+            max_steps=1,
+            max_new_tokens=16,
+            vmpo_k=2,
+            vmpo_kl_estimator="old_policy",
+            vmpo_old_policy_sync_steps=2,
+            learning_rate=1e-5,
+            report_to="none",
+        )
+
+        trainer = VMPOTrainer(
+            model=self.model_id,
+            args=training_args,
+            processing_class=self.tokenizer,
+            train_dataset=dataset,
+        )
+        trainer.train()
+
+        assert trainer.state.log_history[-1]["train_loss"] is not None

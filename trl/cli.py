@@ -27,6 +27,7 @@ from .scripts.kto import make_parser as make_kto_parser
 from .scripts.reward import make_parser as make_reward_parser
 from .scripts.rloo import make_parser as make_rloo_parser
 from .scripts.sft import make_parser as make_sft_parser
+from .scripts.vmpo import make_parser as make_vmpo_parser
 from .scripts.utils import TrlParser
 from .scripts.vllm_serve import main as vllm_serve_main
 from .scripts.vllm_serve import make_parser as make_vllm_serve_parser
@@ -56,6 +57,7 @@ def main():
     make_reward_parser(subparsers)
     make_rloo_parser(subparsers)
     make_sft_parser(subparsers)
+    make_vmpo_parser(subparsers)
     make_vllm_serve_parser(subparsers)
 
     # Parse the arguments; the remaining ones (`launch_args`) are passed to the 'accelerate launch' subparser.
@@ -120,6 +122,10 @@ def main():
     elif args.command == "sft":
         # This simulates running: `accelerate launch <launch args> sft.py <training script args>`.
         _launch_training_script("sft.py", launch_args, sys.argv[2:])  # remove "trl" and "sft"
+
+    elif args.command == "vmpo":
+        # This simulates running: `accelerate launch <launch args> vmpo.py <training script args>`.
+        _launch_training_script("vmpo.py", launch_args, sys.argv[2:])  # remove "trl" and "vmpo"
 
     elif args.command == "vllm-serve":
         (script_args,) = parser.parse_args_and_config()
