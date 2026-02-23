@@ -14,6 +14,7 @@
 
 import math
 import textwrap
+import logging
 from collections.abc import Callable
 from contextlib import nullcontext
 from typing import Any, Literal
@@ -37,6 +38,8 @@ from ..models import create_reference_model
 from .callbacks import SyncRefModelCallback
 from .dar_trainer import DARTrainer, RewardFn
 from .vmpo_config import VMPOConfig
+
+logger = logging.getLogger(__name__)
 
 
 class _SyncOldPolicyModelCallback(TrainerCallback):
@@ -138,8 +141,15 @@ class VMPOTrainer(DARTrainer):
         self._vmpo_alpha = float(args.vmpo_alpha_init)
         self._uses_old_policy_estimator = args.vmpo_kl_estimator in {"old_policy", "old_policy_ref"}
         self.old_policy_model = None
+        self._reward_ema_baseline = 0.0
+        self._near_zero_kl_steps = 0
 
         if self._uses_old_policy_estimator:
+            if args.vmpo_old_policy_sync_steps == 1:
+                logger.warning(
+                    "`vmpo_old_policy_sync_steps=1` with old-policy KL can collapse the trust-region signal "
+                    "(KL≈0). Consider setting it to >= 4."
+                )
             if self.is_deepspeed_enabled and self.accelerator.state.deepspeed_plugin.zero_stage == 3:
                 raise ValueError(
                     "`vmpo_kl_estimator` in `{old_policy, old_policy_ref}` is not supported with DeepSpeed ZeRO-3."
@@ -156,10 +166,13 @@ class VMPOTrainer(DARTrainer):
             )
 
     @staticmethod
-    def _project_positive(value: float, minimum: float) -> float:
+    def _project_positive(value: float, minimum: float, maximum: float | None = None) -> float:
         if not math.isfinite(value):
             return minimum
-        return max(value, minimum)
+        projected = max(value, minimum)
+        if maximum is not None:
+            projected = min(projected, maximum)
+        return projected
 
     def _eta_dual_loss(self, top_advantages: torch.Tensor, eta: torch.Tensor) -> torch.Tensor:
         log_normalizer = torch.logsumexp(top_advantages / eta, dim=0) - math.log(top_advantages.numel())
@@ -180,7 +193,7 @@ class VMPOTrainer(DARTrainer):
 
     def _update_eta_dual(self, top_advantages: torch.Tensor) -> float:
         eta = torch.tensor(
-            self._project_positive(self._vmpo_eta, self.args.vmpo_min_eta),
+            self._project_positive(self._vmpo_eta, self.args.vmpo_min_eta, self.args.vmpo_max_eta),
             dtype=top_advantages.dtype,
             device=top_advantages.device,
             requires_grad=True,
@@ -189,18 +202,41 @@ class VMPOTrainer(DARTrainer):
         grad_eta = torch.autograd.grad(eta_loss, eta)[0]
         if torch.isfinite(grad_eta):
             eta = eta - self.args.vmpo_eta_lr * grad_eta
-            self._vmpo_eta = self._project_positive(float(eta.detach().item()), self.args.vmpo_min_eta)
+            self._vmpo_eta = self._project_positive(
+                float(eta.detach().item()), self.args.vmpo_min_eta, self.args.vmpo_max_eta
+            )
         else:
-            self._vmpo_eta = self._project_positive(self._vmpo_eta, self.args.vmpo_min_eta)
+            self._vmpo_eta = self._project_positive(self._vmpo_eta, self.args.vmpo_min_eta, self.args.vmpo_max_eta)
         return float(eta_loss.detach().item())
 
     def _update_alpha_dual(self, kl_mean: torch.Tensor):
         kl_excess = float(kl_mean.detach().item()) - self.args.vmpo_eps_alpha
         if math.isfinite(kl_excess):
             updated_alpha = self._vmpo_alpha + self.args.vmpo_alpha_lr * kl_excess
-            self._vmpo_alpha = self._project_positive(updated_alpha, self.args.vmpo_min_alpha)
+            self._vmpo_alpha = self._project_positive(updated_alpha, self.args.vmpo_min_alpha, self.args.vmpo_max_alpha)
         else:
-            self._vmpo_alpha = self._project_positive(self._vmpo_alpha, self.args.vmpo_min_alpha)
+            self._vmpo_alpha = self._project_positive(
+                self._vmpo_alpha, self.args.vmpo_min_alpha, self.args.vmpo_max_alpha
+            )
+
+    def _compute_advantages(self, rewards: torch.Tensor, train_eval: Literal["train", "eval"]) -> torch.Tensor:
+        if self.args.vmpo_advantage_baseline == "per_prompt":
+            centered_advantages = rewards - rewards.mean(dim=1, keepdim=True)
+        elif self.args.vmpo_advantage_baseline == "batch":
+            centered_advantages = rewards - rewards.mean()
+        elif self.args.vmpo_advantage_baseline == "ema":
+            if train_eval == "train":
+                batch_mean = rewards.mean().detach().item()
+                self._reward_ema_baseline = (
+                    self.args.vmpo_reward_ema_decay * self._reward_ema_baseline
+                    + (1.0 - self.args.vmpo_reward_ema_decay) * batch_mean
+                )
+            baseline = rewards.new_tensor(self._reward_ema_baseline)
+            centered_advantages = rewards - baseline
+        else:
+            raise ValueError(f"Unknown `vmpo_advantage_baseline`: {self.args.vmpo_advantage_baseline}")
+
+        return self._normalize_advantages(centered_advantages)
 
     def _generate_k_responses_from_model(
         self, generation_model: PreTrainedModel | nn.Module, prompts_batch: dict[str, Any], k: int
@@ -341,15 +377,14 @@ class VMPOTrainer(DARTrainer):
                 )
 
         rewards = rewards_flat.view(batch_size, k)
-        centered_advantages = rewards - rewards.mean(dim=1, keepdim=True)
-        normalized_advantages = self._normalize_advantages(centered_advantages)
+        normalized_advantages = self._compute_advantages(rewards, train_eval=train_eval)
         advantages_flat = normalized_advantages.reshape(-1)
 
         e_step_weights, top_advantages = self._compute_e_step_weights(advantages_flat)
         policy_loss = -(e_step_weights * policy_logps).sum()
 
         eta_value = torch.tensor(
-            self._project_positive(self._vmpo_eta, self.args.vmpo_min_eta),
+            self._project_positive(self._vmpo_eta, self.args.vmpo_min_eta, self.args.vmpo_max_eta),
             dtype=top_advantages.dtype,
             device=top_advantages.device,
         )
@@ -369,16 +404,32 @@ class VMPOTrainer(DARTrainer):
             kl_values = old_policy_logps - policy_logps
             if not self.reference_free:
                 ref_anchor_values = policy_logps - ref_logps
-                ref_anchor_loss = self.args.alpha * ref_anchor_values.mean()
+                ref_anchor_loss = self.args.vmpo_ref_anchor_coef * ref_anchor_values.mean()
         elif self.reference_free:
             kl_values = torch.zeros_like(policy_logps)
         else:
             kl_values = policy_logps - ref_logps
         kl_mean = kl_values.mean()
+        kl_mean_value = float(kl_mean.detach().item())
 
         alpha_value = self._vmpo_alpha
         kl_loss = policy_logps.new_tensor(alpha_value) * kl_mean
         loss = policy_loss + kl_loss + ref_anchor_loss
+
+        if train_eval == "train":
+            if abs(kl_mean_value) <= self.args.vmpo_kl_zero_tol:
+                self._near_zero_kl_steps += 1
+            else:
+                self._near_zero_kl_steps = 0
+
+            if self._near_zero_kl_steps == self.args.vmpo_kl_warning_patience:
+                logger.warning(
+                    "VMPO KL signal has stayed near zero for %d consecutive train steps "
+                    "(|kl_mean| <= %.2e). Consider increasing `vmpo_old_policy_sync_steps` and/or "
+                    "using `vmpo_kl_estimator='old_policy_ref'`.",
+                    self.args.vmpo_kl_warning_patience,
+                    self.args.vmpo_kl_zero_tol,
+                )
 
         if train_eval == "train":
             self._update_alpha_dual(kl_mean)
@@ -418,6 +469,8 @@ class VMPOTrainer(DARTrainer):
             f"{prefix}vmpo/eta_loss": eta_loss,
             f"{prefix}vmpo/alpha": self._vmpo_alpha,
             f"{prefix}vmpo/kl_mean": gathered_kl.mean().item(),
+            f"{prefix}vmpo/reward_ema_baseline": self._reward_ema_baseline,
+            f"{prefix}vmpo/near_zero_kl_streak": float(self._near_zero_kl_steps),
             f"{prefix}vmpo/logps_policy": gathered_policy.mean().item(),
             f"{prefix}vmpo/logps_ref": gathered_ref.mean().item(),
             f"{prefix}vmpo/logps_old": gathered_old.mean().item() if gathered_old is not None else 0.0,

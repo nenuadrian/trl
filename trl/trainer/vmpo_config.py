@@ -71,15 +71,46 @@ class VMPOConfig(DARConfig):
         metadata={"help": "Lower bound used to project alpha after updates."},
     )
     vmpo_kl_estimator: str = field(
-        default="ref",
+        default="old_policy_ref",
         metadata={
             "help": "KL estimator used in the M-step.",
             "choices": ["ref", "behavior", "old_policy", "old_policy_ref"],
         },
     )
     vmpo_old_policy_sync_steps: int = field(
-        default=1,
+        default=16,
         metadata={"help": "How often (in optimizer steps) to refresh the old-policy snapshot."},
+    )
+    vmpo_ref_anchor_coef: float = field(
+        default=0.1,
+        metadata={"help": "Coefficient of the reference-anchor term used with `vmpo_kl_estimator='old_policy_ref'`."},
+    )
+    vmpo_advantage_baseline: str = field(
+        default="ema",
+        metadata={
+            "help": "How to construct the baseline for reward advantages.",
+            "choices": ["per_prompt", "batch", "ema"],
+        },
+    )
+    vmpo_reward_ema_decay: float = field(
+        default=0.98,
+        metadata={"help": "EMA decay used when `vmpo_advantage_baseline='ema'`."},
+    )
+    vmpo_max_eta: float = field(
+        default=100.0,
+        metadata={"help": "Upper clamp for eta dual variable to avoid instability."},
+    )
+    vmpo_max_alpha: float = field(
+        default=100.0,
+        metadata={"help": "Upper clamp for alpha dual variable to avoid instability."},
+    )
+    vmpo_kl_zero_tol: float = field(
+        default=1e-6,
+        metadata={"help": "Threshold below which KL is considered effectively zero."},
+    )
+    vmpo_kl_warning_patience: int = field(
+        default=20,
+        metadata={"help": "Number of consecutive near-zero KL train steps before emitting a warning."},
     )
 
     def __post_init__(self):
@@ -104,3 +135,21 @@ class VMPOConfig(DARConfig):
             raise ValueError("`vmpo_kl_estimator` must be one of: `ref`, `behavior`, `old_policy`, `old_policy_ref`.")
         if self.vmpo_old_policy_sync_steps <= 0:
             raise ValueError("`vmpo_old_policy_sync_steps` must be >= 1.")
+        if self.vmpo_ref_anchor_coef < 0:
+            raise ValueError("`vmpo_ref_anchor_coef` must be >= 0.")
+        if self.vmpo_advantage_baseline not in {"per_prompt", "batch", "ema"}:
+            raise ValueError("`vmpo_advantage_baseline` must be one of: `per_prompt`, `batch`, `ema`.")
+        if self.vmpo_reward_ema_decay < 0 or self.vmpo_reward_ema_decay >= 1:
+            raise ValueError("`vmpo_reward_ema_decay` must be in `[0, 1)`.")
+        if self.vmpo_max_eta <= 0:
+            raise ValueError("`vmpo_max_eta` must be > 0.")
+        if self.vmpo_max_alpha <= 0:
+            raise ValueError("`vmpo_max_alpha` must be > 0.")
+        if self.vmpo_max_eta < self.vmpo_min_eta:
+            raise ValueError("`vmpo_max_eta` must be >= `vmpo_min_eta`.")
+        if self.vmpo_max_alpha < self.vmpo_min_alpha:
+            raise ValueError("`vmpo_max_alpha` must be >= `vmpo_min_alpha`.")
+        if self.vmpo_kl_zero_tol < 0:
+            raise ValueError("`vmpo_kl_zero_tol` must be >= 0.")
+        if self.vmpo_kl_warning_patience <= 0:
+            raise ValueError("`vmpo_kl_warning_patience` must be >= 1.")
