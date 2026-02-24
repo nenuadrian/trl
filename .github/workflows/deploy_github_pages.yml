@@ -1,0 +1,84 @@
+name: Deploy Docs to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - "trl/**"
+      - ".github/workflows/deploy_github_pages.yml"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install docs dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "hf-doc-builder"
+          pip install .
+
+      - name: Build documentation
+        run: |
+          doc-builder build trl docs/source --build_dir _build
+
+      - name: Collect static site
+        run: |
+          set -euo pipefail
+          SITE_DIR=""
+          for CANDIDATE in "_build/trl/main/en" "_build/trl/main" "_build/trl" "_build"; do
+            if [ -f "${CANDIDATE}/index.html" ]; then
+              SITE_DIR="${CANDIDATE}"
+              break
+            fi
+          done
+
+          if [ -z "${SITE_DIR}" ]; then
+            echo "Could not locate built docs site (missing index.html)."
+            find _build -maxdepth 4 -type f | head -n 200
+            exit 1
+          fi
+
+          echo "Using site directory: ${SITE_DIR}"
+          mkdir -p _site
+          cp -R "${SITE_DIR}/." _site/
+          touch _site/.nojekyll
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

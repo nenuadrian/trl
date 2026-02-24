@@ -13,6 +13,8 @@
     title: Paper Index
   title: Conceptual Guides
 - sections: # Sorted alphabetically
+  - local: dar_trainer
+    title: DAR
   - local: dpo_trainer
     title: DPO
   - local: grpo_trainer
@@ -23,6 +25,8 @@
     title: RLOO
   - local: sft_trainer
     title: SFT
+  - local: vmpo_trainer
+    title: VMPO
   title: Trainers
 - sections:
   - local: clis
