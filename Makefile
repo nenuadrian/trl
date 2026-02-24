@@ -10,7 +10,7 @@ test:
 precommit:
 	python scripts/add_copyrights.py
 	pre-commit run --all-files
-	doc-builder style trl tests docs/source --max_len 119
+	python scripts/prepare_mkdocs.py
 
 slow_tests:
 	pytest -m "slow" tests/ $(if $(IS_GITHUB_CI),--report-log "slow_tests.log",)

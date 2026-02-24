@@ -1,0 +1,106 @@
+site_name: TRL Documentation
+site_description: Transformer Reinforcement Learning docs
+docs_dir: docs/_mkdocs
+site_dir: site
+use_directory_urls: true
+theme:
+  name: material
+  features:
+  - navigation.sections
+  - navigation.expand
+  - content.code.copy
+plugins:
+- search
+- mkdocstrings:
+    handlers:
+      python:
+        paths:
+        - .
+        options:
+          show_root_heading: true
+          show_source: false
+markdown_extensions:
+- admonition
+- attr_list
+- def_list
+- md_in_html
+- tables
+- toc
+- pymdownx.highlight
+- pymdownx.inlinehilite
+- pymdownx.superfences
+- pymdownx.arithmatex:
+    generic: true
+extra_javascript:
+- https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+nav:
+- Getting started:
+  - TRL: index.md
+  - Installation: installation.md
+  - Quickstart: quickstart.md
+- Conceptual Guides:
+  - Dataset Formats: dataset_formats.md
+  - Paper Index: paper_index.md
+- Trainers:
+  - DAR: dar_trainer.md
+  - DPO: dpo_trainer.md
+  - GRPO: grpo_trainer.md
+  - Reward: reward_trainer.md
+  - RLOO: rloo_trainer.md
+  - SFT: sft_trainer.md
+  - VMPO: vmpo_trainer.md
+- How-to guides:
+  - Command Line Interface (CLI): clis.md
+  - Training using Jobs: jobs_training.md
+  - Customizing the Training: customization.md
+  - Reducing Memory Usage: reducing_memory_usage.md
+  - Speeding Up Training: speeding_up_training.md
+  - Distributing Training: distributing_training.md
+  - Using Trained Models: use_model.md
+- Integrations:
+  - DeepSpeed: deepspeed_integration.md
+  - Kernels Hub: kernels_hub.md
+  - Liger Kernel: liger_kernel_integration.md
+  - PEFT: peft_integration.md
+  - Post Training Toolkit: ptt_integration.md
+  - RapidFire AI: rapidfire_integration.md
+  - Trackio: trackio_integration.md
+  - Unsloth: unsloth_integration.md
+  - vLLM: vllm_integration.md
+- Examples:
+  - Example Overview: example_overview.md
+  - Community Tutorials: community_tutorials.md
+  - LoRA Without Regret: lora_without_regret.md
+- API:
+  - Utilities:
+    - Chat Template Utilities: chat_template_utils.md
+    - Data Utilities: data_utils.md
+    - Model Utilities: model_utils.md
+    - Script Utilities: script_utils.md
+  - Callbacks: callbacks.md
+  - Reward Functions: rewards.md
+  - Others: others.md
+- Experimental:
+  - Experimental Overview: experimental_overview.md
+  - OpenEnv Integration: openenv.md
+  - BEMA for Reference Model: bema_for_reference_model.md
+  - BCO: bco_trainer.md
+  - CPO: cpo_trainer.md
+  - GFPO: gfpo.md
+  - GKD: gkd_trainer.md
+  - GOLD: gold_trainer.md
+  - GRPO With Replay Buffer: grpo_with_replay_buffer.md
+  - GSPO-token: gspo_token.md
+  - Judges: judges.md
+  - KTO: kto_trainer.md
+  - MergeModelCallback: merge_model_callback.md
+  - MiniLLM: minillm_trainer.md
+  - Nash-MD: nash_md_trainer.md
+  - NeMo Gym: nemo_gym.md
+  - Online DPO: online_dpo_trainer.md
+  - ORPO: orpo_trainer.md
+  - PAPO: papo_trainer.md
+  - PPO: ppo_trainer.md
+  - PRM: prm_trainer.md
+  - WinRateCallback: winrate_callback.md
+  - XPO: xpo_trainer.md
