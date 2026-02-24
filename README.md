@@ -1,5 +1,7 @@
 # TRL - Transformer Reinforcement Learning
 
+[![Deploy Docs to GitHub Pages](https://github.com/nenuadrian/trl/actions/workflows/deploy_github_pages.yml/badge.svg)](https://github.com/nenuadrian/trl/actions/workflows/deploy_github_pages.yml)
+
 <div style="text-align: center">
     <img src="https://huggingface.co/datasets/trl-lib/documentation-images/resolve/main/trl_banner_dark.png" alt="TRL Banner">
 </div>
