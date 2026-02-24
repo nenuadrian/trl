@@ -5,6 +5,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export NUM_PROCESSES="${NUM_PROCESSES:-2}"
-export OUTPUT_DIR="${OUTPUT_DIR:-Qwen2-0.5B-VMPO-online-2gpu-prompts-k2}"
+export OUTPUT_DIR="${OUTPUT_DIR:-Qwen2-0.5B-VMPO-online-2gpu-prompts-k2-stable}"
 
 bash "${SCRIPT_DIR}/run_vmpo_ultrafeedback_prompt_4gpu.sh"
