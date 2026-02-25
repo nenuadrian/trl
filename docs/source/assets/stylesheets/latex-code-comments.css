@@ -1,0 +1,8 @@
+pre code .latex-code-comment {
+  color: var(--md-code-fg-color, #d0d0d0);
+  font-style: italic;
+}
+
+pre code .latex-code-comment .mjx-chtml {
+  font-size: 0.95em;
+}

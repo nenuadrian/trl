@@ -55,6 +55,11 @@ KNOWN_MODULE_PREFIXES = {
     "trainer",
 }
 
+SHOW_SOURCE_SYMBOLS = {
+    "trl.trainer.dar_trainer.DARTrainer",
+    "trl.trainer.vmpo_trainer.VMPOTrainer",
+}
+
 
 def module_name_for_path(path: Path) -> str:
     return ".".join(path.relative_to(ROOT).with_suffix("").parts)
@@ -176,11 +181,17 @@ def transform_markdown(
             append_blank_line(output_lines)
             if resolved in all_symbols:
                 output_lines.append(f"::: {resolved}")
-                if members:
+                show_source = resolved in SHOW_SOURCE_SYMBOLS
+                if members or show_source:
                     output_lines.append("    options:")
+                    if show_source:
+                        output_lines.append("      show_source: true")
                     output_lines.append("      members:")
-                    for member in members:
-                        output_lines.append(f"        - {member}")
+                    if members:
+                        for member in members:
+                            output_lines.append(f"        - {member}")
+                    else:
+                        output_lines.append("        []")
             else:
                 unresolved_symbols.add((raw_symbol, resolved))
                 output_lines.append(f"### `{raw_symbol}`")
