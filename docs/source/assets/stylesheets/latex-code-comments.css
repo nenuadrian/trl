@@ -1,6 +1,16 @@
+:root {
+  --latex-code-comment-color: #ff4d4f;
+}
+
 pre code .latex-code-comment {
-  color: var(--md-code-fg-color, #d0d0d0);
+  color: var(--latex-code-comment-color) !important;
   font-style: italic;
+}
+
+pre code .latex-code-comment mjx-container,
+pre code .latex-code-comment .mjx-chtml,
+pre code .latex-code-comment .mjx-char {
+  color: var(--latex-code-comment-color) !important;
 }
 
 pre code .latex-code-comment .mjx-chtml {
