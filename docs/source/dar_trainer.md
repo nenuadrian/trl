@@ -86,6 +86,12 @@ DAR logs the following core metrics during train/eval:
 - `dar/logps_policy`, `dar/logps_ref`, `dar/logps_behavior`
 - `dar/loss`
 
+## Generated API HTML quick links
+
+- [`DARTrainer`](#dartrainer)
+- [`DARConfig`](#darconfig)
+- [`DataCollatorForDAR`](#datacollatorfordar)
+
 ## DARTrainer
 
 [[autodoc]] DARTrainer

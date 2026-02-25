@@ -92,6 +92,11 @@ VMPO logs the following core metrics during train/eval:
 - `vmpo/reward_ema_baseline`, `vmpo/near_zero_kl_streak`
 - `vmpo/loss`
 
+## Generated API HTML quick links
+
+- [`VMPOTrainer`](#vmpotrainer)
+- [`VMPOConfig`](#vmpoconfig)
+
 ## VMPOTrainer
 
 [[autodoc]] VMPOTrainer

@@ -302,6 +302,10 @@ def write_mkdocs_config(nav: list[dict]) -> None:
         ],
         "extra_javascript": [
             "https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js",
+            "assets/javascripts/latex-code-comments.js",
+        ],
+        "extra_css": [
+            "assets/stylesheets/latex-code-comments.css",
         ],
         "nav": nav,
     }

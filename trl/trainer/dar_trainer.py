@@ -52,6 +52,7 @@ class DataCollatorForDAR(DataCollatorMixin):
     Data collator for DAR datasets.
 
     It always pads prompts and keeps optional offline completion/reward fields in Python lists.
+    Any extra metadata columns are forwarded as Python lists for custom reward functions.
     """
 
     pad_token_id: int
@@ -73,6 +74,19 @@ class DataCollatorForDAR(DataCollatorMixin):
             output["rewards"] = [example["rewards"] for example in examples]
         if "behavior_logps" in examples[0]:
             output["behavior_logps"] = [example["behavior_logps"] for example in examples]
+
+        # Keep any additional columns (e.g. gold answers for custom online reward functions).
+        handled_keys = {
+            "prompt_input_ids",
+            "prompt_attention_mask",
+            "prompt",
+            "completion_input_ids",
+            "rewards",
+            "behavior_logps",
+        }
+        for key in examples[0]:
+            if key not in handled_keys:
+                output[key] = [example[key] for example in examples]
 
         return output
 
@@ -614,16 +628,20 @@ class DARTrainer(DPOTrainer):
                     )
 
         rewards = rewards_flat.view(batch_size, k)
+        # Latex: A_{i,k} = r_{i,k} - (1/K) \sum_{j=1}^{K} r_{i,j}
         centered_advantages = rewards - rewards.mean(dim=1, keepdim=True)
         normalized_advantages = self._normalize_advantages(centered_advantages)
         normalized_advantages_flat = normalized_advantages.reshape(-1)
 
         scale = float(self.args.alpha + self.args.beta)
+        # Latex: \log w_{i,k} = (\alpha/(\alpha+\beta))(\log\pi_ref-\log\pi_beta) + A_{i,k}/(\alpha+\beta)
         log_reg_weight = (self.args.alpha / scale) * (ref_logps - behavior_logps_flat)
         log_adv_weight = normalized_advantages_flat / scale
         weights = cap_exp(log_reg_weight + log_adv_weight)
+        # Latex: w_{i,k} = \min(\exp(\log w_{i,k}), w_{clip})
         weights = torch.clamp(weights, max=self.args.dar_wclip)
 
+        # Latex: L_DAR = -(1/(B K)) \sum_{i=1}^{B} \sum_{k=1}^{K} w_{i,k}\log\pi_\theta(y_{i,k}|x_i)
         losses = -(weights * policy_logps)
         loss = losses.mean()
 

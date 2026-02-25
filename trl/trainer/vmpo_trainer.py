@@ -175,6 +175,7 @@ class VMPOTrainer(DARTrainer):
         return projected
 
     def _eta_dual_loss(self, top_advantages: torch.Tensor, eta: torch.Tensor) -> torch.Tensor:
+        # Latex: L_\eta = \eta \epsilon_\eta + \eta \log((1/N)\sum_{j=1}^{N}\exp(A_j/\eta))
         log_normalizer = torch.logsumexp(top_advantages / eta, dim=0) - math.log(top_advantages.numel())
         return eta * self.args.vmpo_eps_eta + eta * log_normalizer
 
@@ -185,6 +186,7 @@ class VMPOTrainer(DARTrainer):
         top_advantages, top_indices = torch.topk(advantages_flat, k=num_selected)
         scaled_advantages = top_advantages / max(self._vmpo_eta, self.args.vmpo_min_eta)
         scaled_advantages = scaled_advantages - scaled_advantages.max()
+        # Latex: q_j \propto \exp(A_j/\eta) on selected top-advantage samples (E-step target distribution)
         top_weights = torch.softmax(scaled_advantages, dim=0)
 
         weights = torch.zeros_like(advantages_flat)
@@ -201,6 +203,7 @@ class VMPOTrainer(DARTrainer):
         eta_loss = self._eta_dual_loss(top_advantages.detach(), eta)
         grad_eta = torch.autograd.grad(eta_loss, eta)[0]
         if torch.isfinite(grad_eta):
+            # Latex: \eta \leftarrow \Pi_{[\eta_{min},\eta_{max}]}(\eta - \lambda_\eta \nabla_\eta L_\eta)
             eta = eta - self.args.vmpo_eta_lr * grad_eta
             self._vmpo_eta = self._project_positive(
                 float(eta.detach().item()), self.args.vmpo_min_eta, self.args.vmpo_max_eta
@@ -212,6 +215,7 @@ class VMPOTrainer(DARTrainer):
     def _update_alpha_dual(self, kl_mean: torch.Tensor):
         kl_excess = float(kl_mean.detach().item()) - self.args.vmpo_eps_alpha
         if math.isfinite(kl_excess):
+            # Latex: \alpha \leftarrow \Pi_{[\alpha_{min},\alpha_{max}]}(\alpha + \lambda_\alpha(\mathrm{KL}-\epsilon_\alpha))
             updated_alpha = self._vmpo_alpha + self.args.vmpo_alpha_lr * kl_excess
             self._vmpo_alpha = self._project_positive(updated_alpha, self.args.vmpo_min_alpha, self.args.vmpo_max_alpha)
         else:
@@ -236,6 +240,7 @@ class VMPOTrainer(DARTrainer):
         else:
             raise ValueError(f"Unknown `vmpo_advantage_baseline`: {self.args.vmpo_advantage_baseline}")
 
+        # Latex: A_{i,k} = r_{i,k} - b_i, followed by normalization before the E-step weighting
         return self._normalize_advantages(centered_advantages)
 
     def _generate_k_responses_from_model(
@@ -381,6 +386,7 @@ class VMPOTrainer(DARTrainer):
         advantages_flat = normalized_advantages.reshape(-1)
 
         e_step_weights, top_advantages = self._compute_e_step_weights(advantages_flat)
+        # Latex: L_\pi = -\sum_j q_j \log\pi_\theta(y_j|x_j)
         policy_loss = -(e_step_weights * policy_logps).sum()
 
         eta_value = torch.tensor(
@@ -397,23 +403,30 @@ class VMPOTrainer(DARTrainer):
         if self.args.vmpo_kl_estimator == "behavior":
             if behavior_logps_flat is None:
                 behavior_logps_flat = policy_logps.detach()
+            # Latex: \widehat{\mathrm{KL}} = \mathbb{E}[\log\pi_\beta - \log\pi_\theta]
             kl_values = behavior_logps_flat - policy_logps
         elif self.args.vmpo_kl_estimator == "old_policy":
+            # Latex: \widehat{\mathrm{KL}} = \mathbb{E}[\log\pi_{old} - \log\pi_\theta]
             kl_values = old_policy_logps - policy_logps
         elif self.args.vmpo_kl_estimator == "old_policy_ref":
+            # Latex: \widehat{\mathrm{KL}} = \mathbb{E}[\log\pi_{old} - \log\pi_\theta]
             kl_values = old_policy_logps - policy_logps
             if not self.reference_free:
+                # Latex: L_{ref} = c_{ref}\,\mathbb{E}[\log\pi_\theta - \log\pi_{ref}]
                 ref_anchor_values = policy_logps - ref_logps
                 ref_anchor_loss = self.args.vmpo_ref_anchor_coef * ref_anchor_values.mean()
         elif self.reference_free:
             kl_values = torch.zeros_like(policy_logps)
         else:
+            # Latex: \widehat{\mathrm{KL}} = \mathbb{E}[\log\pi_\theta - \log\pi_{ref}]
             kl_values = policy_logps - ref_logps
         kl_mean = kl_values.mean()
         kl_mean_value = float(kl_mean.detach().item())
 
         alpha_value = self._vmpo_alpha
+        # Latex: L_{KL} = \alpha \cdot \widehat{\mathrm{KL}}
         kl_loss = policy_logps.new_tensor(alpha_value) * kl_mean
+        # Latex: L_{VMPO} = L_\pi + L_{KL} + L_{ref}
         loss = policy_loss + kl_loss + ref_anchor_loss
 
         if train_eval == "train":

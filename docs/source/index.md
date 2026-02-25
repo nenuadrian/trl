@@ -31,6 +31,18 @@ Below is the current list of TRL trainers, organized by method type (⚡️ = vL
 - [`VMPOTrainer`](vmpo_trainer)
 - [`XPOTrainer`](xpo_trainer) 🧪 ⚡️
 
+### Generated API HTML links
+
+- [`DAR trainer page`](dar_trainer/)
+- [`DAR trainer HTML file`](dar_trainer/index.html)
+- [`DARTrainer API section`](dar_trainer/#dartrainer)
+- [`DARConfig API section`](dar_trainer/#darconfig)
+- [`DataCollatorForDAR API section`](dar_trainer/#datacollatorfordar)
+- [`VMPO trainer page`](vmpo_trainer/)
+- [`VMPO trainer HTML file`](vmpo_trainer/index.html)
+- [`VMPOTrainer API section`](vmpo_trainer/#vmpotrainer)
+- [`VMPOConfig API section`](vmpo_trainer/#vmpoconfig)
+
 ### Reward modeling
 
 - [`RewardTrainer`](reward_trainer)

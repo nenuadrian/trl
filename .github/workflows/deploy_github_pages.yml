@@ -64,3 +64,25 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Publish DAR/VMPO docs links
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          {
+            echo "## Generated API docs (from code)"
+            echo "Built with \`scripts/prepare_mkdocs.py\` + mkdocstrings during this workflow."
+            echo ""
+            echo "### DAR"
+            echo "- Page: ${PAGE_URL}/dar_trainer/"
+            echo "- HTML file: ${PAGE_URL}/dar_trainer/index.html"
+            echo "- DARTrainer: ${PAGE_URL}/dar_trainer/#dartrainer"
+            echo "- DARConfig: ${PAGE_URL}/dar_trainer/#darconfig"
+            echo "- DataCollatorForDAR: ${PAGE_URL}/dar_trainer/#datacollatorfordar"
+            echo ""
+            echo "### VMPO"
+            echo "- Page: ${PAGE_URL}/vmpo_trainer/"
+            echo "- HTML file: ${PAGE_URL}/vmpo_trainer/index.html"
+            echo "- VMPOTrainer: ${PAGE_URL}/vmpo_trainer/#vmpotrainer"
+            echo "- VMPOConfig: ${PAGE_URL}/vmpo_trainer/#vmpoconfig"
+          } >> "$GITHUB_STEP_SUMMARY"
