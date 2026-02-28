@@ -645,6 +645,12 @@ class DARTrainer(DPOTrainer):
         losses = -(weights * policy_logps)
         loss = losses.mean()
 
+        # Completion lengths (number of non-padding tokens per completion).
+        completion_lengths = completion_attention_mask.sum(dim=1).float()
+
+        # Implicit KL divergence from reference: E[log π_θ - log π_ref].
+        kl_from_ref = (policy_logps - ref_logps).detach()
+
         prefix = "eval_" if train_eval == "eval" else ""
         gathered_rewards = self.accelerator.gather_for_metrics(rewards_flat.detach())
         gathered_advantages = self.accelerator.gather_for_metrics(normalized_advantages_flat.detach())
@@ -653,14 +659,29 @@ class DARTrainer(DPOTrainer):
         gathered_ref = self.accelerator.gather_for_metrics(ref_logps.detach())
         gathered_behavior = self.accelerator.gather_for_metrics(behavior_logps_flat.detach())
         gathered_losses = self.accelerator.gather_for_metrics(losses.detach())
+        gathered_lengths = self.accelerator.gather_for_metrics(completion_lengths.detach())
+        gathered_kl_from_ref = self.accelerator.gather_for_metrics(kl_from_ref)
+        gathered_log_reg = self.accelerator.gather_for_metrics(log_reg_weight.detach())
+        gathered_log_adv = self.accelerator.gather_for_metrics(log_adv_weight.detach())
+
+        # Fraction of weights that were clipped to dar_wclip.
+        clip_fraction = (gathered_weights >= self.args.dar_wclip).float().mean().item()
 
         metrics = {
             f"{prefix}dar/rewards_mean": gathered_rewards.mean().item(),
             f"{prefix}dar/rewards_std": gathered_rewards.std(unbiased=False).item(),
+            f"{prefix}dar/rewards_p25": gathered_rewards.quantile(0.25).item(),
+            f"{prefix}dar/rewards_median": gathered_rewards.median().item(),
+            f"{prefix}dar/rewards_p75": gathered_rewards.quantile(0.75).item(),
             f"{prefix}dar/advantages_mean": gathered_advantages.mean().item(),
             f"{prefix}dar/advantages_std": gathered_advantages.std(unbiased=False).item(),
             f"{prefix}dar/weights_mean": gathered_weights.mean().item(),
             f"{prefix}dar/weights_max": gathered_weights.max().item(),
+            f"{prefix}dar/weights_clip_fraction": clip_fraction,
+            f"{prefix}dar/log_reg_weight_mean": gathered_log_reg.mean().item(),
+            f"{prefix}dar/log_adv_weight_mean": gathered_log_adv.mean().item(),
+            f"{prefix}dar/kl_from_ref": gathered_kl_from_ref.mean().item(),
+            f"{prefix}dar/completion_length_mean": gathered_lengths.mean().item(),
             f"{prefix}dar/logps_policy": gathered_policy.mean().item(),
             f"{prefix}dar/logps_ref": gathered_ref.mean().item(),
             f"{prefix}dar/logps_behavior": gathered_behavior.mean().item(),
