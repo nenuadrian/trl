@@ -1,10 +1,6 @@
 # LLM Experiments: V-MPO and DAR via TRL
 
-This document describes the experiment plan for validating EM-based policy optimisation for LLMs, as implemented in the V-MPO and DAR trainers.
-
 All scripts live in `benchmarks/` and use `accelerate launch` with the `accelerate_4gpu_fp16.yaml` config. Every script accepts `CUDA_VISIBLE_DEVICES` and `NUM_PROCESSES` overrides so you can run on 1, 2, or 4 GPUs.
-
-Base model for all runs: **Qwen/Qwen2-0.5B-Instruct** (small enough for fast iteration).
 
 ---
 
