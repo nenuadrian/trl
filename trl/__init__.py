@@ -50,6 +50,8 @@ _import_structure = {
         "BEMACallback",
         "DARConfig",
         "DARTrainer",
+        "RESTConfig",
+        "RESTTrainer",
         "DPOConfig",
         "DPOTrainer",
         "FDivergenceConstants",  # deprecated import
@@ -102,6 +104,8 @@ if TYPE_CHECKING:
         BEMACallback,
         DARConfig,
         DARTrainer,
+        RESTConfig,
+        RESTTrainer,
         DPOConfig,
         DPOTrainer,
         FDivergenceConstants,  # deprecated import

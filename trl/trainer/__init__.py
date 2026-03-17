@@ -27,6 +27,8 @@ _import_structure = {
     ],
     "dar_config": ["DARConfig"],
     "dar_trainer": ["DARTrainer"],
+    "rest_config": ["RESTConfig"],
+    "rest_trainer": ["RESTTrainer"],
     "dpo_config": [
         "DPOConfig",
         "FDivergenceConstants",  # deprecated import
@@ -67,6 +69,8 @@ if TYPE_CHECKING:
     )
     from .dar_config import DARConfig
     from .dar_trainer import DARTrainer
+    from .rest_config import RESTConfig
+    from .rest_trainer import RESTTrainer
     from .dpo_config import (
         DPOConfig,
         FDivergenceConstants,  # deprecated import
