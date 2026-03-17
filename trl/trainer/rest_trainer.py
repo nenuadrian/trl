@@ -356,7 +356,7 @@ class RESTTrainer(BaseTrainer):
 
     @torch.no_grad()
     def _generate_completions(self, tokenizer: PreTrainedTokenizerBase) -> list[dict[str, Any]]:
-        """E-step: Generate multiple completions per prompt."""
+        """E-step: Generate `num_samples_per_prompt` completions per prompt using `num_return_sequences`."""
         args: RESTConfig = self.args
         model = self.accelerator.unwrap_model(self.model)
         model.eval()
@@ -365,28 +365,24 @@ class RESTTrainer(BaseTrainer):
         if dataset is None:
             raise ValueError("No training dataset provided for generation.")
 
-        # Extract prompts
-        prompts = []
-        prompt_indices = []
-        for idx, sample in enumerate(dataset):
+        # Build (prompt_text, original_sample) pairs
+        prompt_texts: list[str] = []
+        original_samples: list[dict[str, Any]] = []
+        for sample in dataset:
             prompt_text = sample.get("prompt", "")
             if not prompt_text:
-                # Try to build prompt from messages
                 if "messages" in sample:
-                    from ..data_utils import maybe_apply_chat_template as _apply_ct
-
-                    processed = _apply_ct(sample, tokenizer=tokenizer)
+                    processed = maybe_apply_chat_template(sample, tokenizer=tokenizer)
                     prompt_text = processed.get("prompt", str(sample["messages"]))
                 elif "text" in sample:
                     prompt_text = sample["text"]
             if prompt_text:
-                prompts.append(prompt_text)
-                prompt_indices.append(idx)
+                prompt_texts.append(prompt_text)
+                original_samples.append(dict(sample))
 
-        if not prompts:
+        if not prompt_texts:
             raise ValueError("No prompts found in the dataset. Ensure the dataset has a 'prompt' column.")
 
-        all_results = []
         num_samples = args.num_samples_per_prompt
         gen_batch_size = args.generation_batch_size
 
@@ -397,12 +393,16 @@ class RESTTrainer(BaseTrainer):
             "top_k": args.generation_top_k if args.generation_top_k > 0 else None,
             "top_p": args.generation_top_p,
             "pad_token_id": self.pad_token_id,
+            # Generate all num_samples completions for each prompt in one call.
+            # Outputs are interleaved: [p0_s0, p0_s1, ..., p1_s0, p1_s1, ...]
+            "num_return_sequences": num_samples,
         }
 
-        # Generate in batches of prompts, num_samples completions each
-        for batch_start in range(0, len(prompts), gen_batch_size):
-            batch_prompts = prompts[batch_start : batch_start + gen_batch_size]
-            batch_indices = prompt_indices[batch_start : batch_start + gen_batch_size]
+        all_results: list[dict[str, Any]] = []
+
+        for batch_start in range(0, len(prompt_texts), gen_batch_size):
+            batch_prompts = prompt_texts[batch_start : batch_start + gen_batch_size]
+            batch_samples = original_samples[batch_start : batch_start + gen_batch_size]
 
             encoded = tokenizer(
                 batch_prompts,
@@ -416,81 +416,26 @@ class RESTTrainer(BaseTrainer):
             attention_mask = encoded["attention_mask"].to(model.device)
             prompt_length = input_ids.shape[1]
 
-            # Generate num_samples completions per prompt
-            for _ in range(0, num_samples, max(1, gen_batch_size)):
-                # num_return_sequences generates multiple completions per input in one call
-                actual_num = min(num_samples - len([r for r in all_results if r["_prompt_idx"] == batch_indices[0]]),
-                                 num_samples) if batch_indices else num_samples
-                if actual_num <= 0:
-                    break
+            # Shape: (len(batch_prompts) * num_samples, seq_len)
+            generated = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **generation_kwargs,
+            )
 
-                current_gen_kwargs = {**generation_kwargs, "num_return_sequences": 1}
-                generated = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **current_gen_kwargs,
-                )
+            completion_ids = generated[:, prompt_length:]
+            completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
 
-                completion_ids = generated[:, prompt_length:]
-                completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-
-                for i, (prompt, completion) in enumerate(zip(batch_prompts, completions, strict=False)):
-                    original_sample = dict(dataset[batch_indices[i]]) if isinstance(dataset, Dataset) else {}
+            # Deinterleave: completions[i * num_samples + j] → prompt i, sample j
+            for i, (prompt, original_sample) in enumerate(zip(batch_prompts, batch_samples, strict=True)):
+                extra = {k: v for k, v in original_sample.items() if k not in ("prompt", "completion", "reward")}
+                for j in range(num_samples):
                     all_results.append({
                         "prompt": prompt,
-                        "completion": completion,
+                        "completion": completions[i * num_samples + j],
                         "reward": None,
-                        "_prompt_idx": batch_indices[i],
-                        **{k: v for k, v in original_sample.items() if k not in ("prompt", "completion", "reward")},
-                    })
-
-        # Generate remaining samples to reach num_samples per prompt
-        # Count how many we have per prompt
-        counts = defaultdict(int)
-        for r in all_results:
-            counts[r["_prompt_idx"]] += 1
-
-        remaining_needed = []
-        for idx, prompt in zip(prompt_indices, prompts, strict=True):
-            still_need = num_samples - counts.get(idx, 0)
-            for _ in range(still_need):
-                remaining_needed.append((idx, prompt))
-
-        if remaining_needed:
-            for batch_start in range(0, len(remaining_needed), gen_batch_size):
-                batch = remaining_needed[batch_start : batch_start + gen_batch_size]
-                batch_prompts_r = [b[1] for b in batch]
-                batch_indices_r = [b[0] for b in batch]
-
-                encoded = tokenizer(
-                    batch_prompts_r,
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=(args.max_length or 512) - args.max_new_tokens,
-                    add_special_tokens=False,
-                )
-                input_ids = encoded["input_ids"].to(model.device)
-                attention_mask = encoded["attention_mask"].to(model.device)
-                prompt_length = input_ids.shape[1]
-
-                generated = model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **{**generation_kwargs, "num_return_sequences": 1},
-                )
-
-                completion_ids = generated[:, prompt_length:]
-                completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-
-                for i, completion in enumerate(completions):
-                    original_sample = dict(dataset[batch_indices_r[i]]) if isinstance(dataset, Dataset) else {}
-                    all_results.append({
-                        "prompt": batch_prompts_r[i],
-                        "completion": completion,
-                        "reward": None,
-                        "_prompt_idx": batch_indices_r[i],
-                        **{k: v for k, v in original_sample.items() if k not in ("prompt", "completion", "reward")},
+                        "_prompt_idx": batch_start + i,
+                        **extra,
                     })
 
         model.train()
@@ -502,10 +447,14 @@ class RESTTrainer(BaseTrainer):
         completions = [d["completion"] for d in data]
 
         if self.reward_fn is not None:
+            # Forward extra fields (e.g. "answer" from GSM8K) as the `batch` kwarg so that
+            # reward functions like `reasoning_em_reward` can access ground-truth answers.
+            extra_keys = [k for k in data[0] if k not in ("prompt", "completion", "reward", "_prompt_idx")]
+            batch = {k: [d[k] for d in data] for k in extra_keys} if extra_keys else None
             try:
-                rewards = self.reward_fn(prompts=prompts, completions=completions)
+                rewards = self.reward_fn(prompts=prompts, completions=completions, batch=batch)
             except TypeError:
-                rewards = self.reward_fn(prompts, completions)
+                rewards = self.reward_fn(prompts=prompts, completions=completions)
             rewards = [float(r) for r in rewards]
         elif self.reward_model is not None:
             rewards = self._score_with_reward_model(prompts, completions)
