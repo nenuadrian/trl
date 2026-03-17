@@ -374,6 +374,8 @@ class RESTTrainer(BaseTrainer):
                 if "messages" in sample:
                     processed = maybe_apply_chat_template(sample, tokenizer=tokenizer)
                     prompt_text = processed.get("prompt", str(sample["messages"]))
+                elif "question" in sample:
+                    prompt_text = sample["question"]
                 elif "text" in sample:
                     prompt_text = sample["text"]
             if prompt_text:
