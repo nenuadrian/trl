@@ -702,8 +702,7 @@ class MaxMinPPOTrainer(PPOTrainer):
                         _, score, _ = get_reward(
                             rm, postprocessed_query_response, processing_class.pad_token_id, context_length
                         )
-                        if score.dim() > 1:
-                            score = score[:, 0]
+                        score = self._ensure_1d(score)
                         table[f"score_rm{rm_idx}"].extend(
                             self.accelerator.gather_for_metrics(score).float().cpu().numpy()
                         )
