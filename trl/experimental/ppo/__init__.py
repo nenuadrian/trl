@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .maxmin_ppo_config import MaxMinPPOConfig
+from .maxmin_ppo_trainer import MaxMinPPOTrainer
 from .modeling_value_head import (
     AutoModelForCausalLMWithValueHead,
     AutoModelForSeq2SeqLMWithValueHead,
@@ -24,6 +26,8 @@ from .ppo_trainer import PPOTrainer
 __all__ = [
     "AutoModelForCausalLMWithValueHead",
     "AutoModelForSeq2SeqLMWithValueHead",
+    "MaxMinPPOConfig",
+    "MaxMinPPOTrainer",
     "PreTrainedModelWrapper",
     "PPOConfig",
     "PPOTrainer",
