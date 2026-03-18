@@ -142,6 +142,13 @@ class MaxMinPPOTrainer(PPOTrainer):
         for i, rm in enumerate(reward_models):
             self._fix_score_head(rm, f"reward_model_{i}")
 
+        # Diagnostic: confirm score head shapes after fix
+        if hasattr(value_model, "score") and hasattr(value_model.score, "out_features"):
+            print(f"[MaxMinPPO] value_model.score: Linear({value_model.score.in_features}, {value_model.score.out_features})")
+        for i, rm in enumerate(reward_models):
+            if hasattr(rm, "score") and hasattr(rm.score, "out_features"):
+                print(f"[MaxMinPPO] reward_model_{i}.score: Linear({rm.score.in_features}, {rm.score.out_features})")
+
         # Store all reward models before calling super().__init__
         # Pass the first reward model to the parent class as the "primary" reward model
         self.reward_models = reward_models
@@ -246,6 +253,31 @@ class MaxMinPPOTrainer(PPOTrainer):
 
         else:
             raise ValueError(f"Unknown maxmin_strategy: {strategy}")
+
+    @staticmethod
+    def _ensure_2d(tensor: torch.Tensor) -> torch.Tensor:
+        """Reduce a 3D tensor (batch, seq, labels) to 2D (batch, seq).
+
+        Handles the case where score/value heads have num_labels > 1
+        (e.g. when loading CausalLM checkpoints as SeqCls models).
+        """
+        if tensor.dim() == 3:
+            if tensor.size(-1) == 1:
+                return tensor.squeeze(-1)
+            return tensor[:, :, 0]
+        return tensor
+
+    @staticmethod
+    def _ensure_1d(tensor: torch.Tensor) -> torch.Tensor:
+        """Reduce a 2D tensor (batch, labels) to 1D (batch,).
+
+        Same as _ensure_2d but for per-sample scores.
+        """
+        if tensor.dim() == 2:
+            if tensor.size(-1) == 1:
+                return tensor.squeeze(-1)
+            return tensor[:, 0]
+        return tensor
 
     def train(self):
         args = self.args
@@ -378,24 +410,14 @@ class MaxMinPPOTrainer(PPOTrainer):
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
-                    value = full_value[:, context_length - 1 : -1]
-                    # Ensure value is 2D (batch, seq). When num_labels > 1 (e.g. score head
-                    # initialized from a causal LM checkpoint), take only the first label.
-                    if value.dim() == 3:
-                        if value.size(-1) == 1:
-                            value = value.squeeze(-1)
-                        else:
-                            value = value[:, :, 0]
+                    value = self._ensure_2d(full_value[:, context_length - 1 : -1])
 
                     # Score with each reward model
                     for rm_idx, rm in enumerate(reward_models):
                         _, rm_score, _ = get_reward(
                             rm, postprocessed_query_response, processing_class.pad_token_id, context_length
                         )
-                        # Handle reward models with num_labels > 1 (e.g. CausalLM checkpoint
-                        # loaded as SeqCls without proper score head reinitialization)
-                        if rm_score.dim() > 1:
-                            rm_score = rm_score[:, 0]
+                        rm_score = self._ensure_1d(rm_score)
                         all_rm_scores[rm_idx].append(rm_score)
 
                     responses.append(response)
@@ -489,7 +511,7 @@ class MaxMinPPOTrainer(PPOTrainer):
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
-                            vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                            vpred = self._ensure_2d(vpred_temp[:, context_length - 1 : -1])
                             vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
                             vpredclipped = torch.clamp(
                                 vpred,
