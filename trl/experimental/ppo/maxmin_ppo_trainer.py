@@ -650,26 +650,16 @@ class MaxMinPPOTrainer(PPOTrainer):
             output_dir = self.args.output_dir
 
         if not _internal_call and hasattr(self.model, "policy"):
-            # Extract the policy model for saving
             policy = self.model.policy
             if self.is_deepspeed_enabled:
-                # Save via DeepSpeed engine's save_checkpoint or state_dict
-                import deepspeed
-
-                # The DeepSpeed engine is self.model_wrapped or self.deepspeed
-                # We need to save just the policy weights
-                state_dict = self.accelerator.get_state_dict(self.deepspeed)
+                # Use DeepSpeed's native checkpoint save (works with ZeRO-2 and ZeRO-3)
+                self.deepspeed.save_checkpoint(output_dir)
+                # Also save tokenizer and config on main process
                 if self.accelerator.is_main_process:
-                    # Filter to only policy keys
-                    policy_prefix = "policy."
-                    policy_state_dict = {}
-                    for k, v in state_dict.items():
-                        if k.startswith(policy_prefix):
-                            policy_state_dict[k[len(policy_prefix) :]] = v
-
-                    policy.save_pretrained(output_dir, state_dict=policy_state_dict)
+                    policy.config.save_pretrained(output_dir)
                     if self.processing_class is not None:
                         self.processing_class.save_pretrained(output_dir)
+                self.accelerator.wait_for_everyone()
             else:
                 backup_model = self.model
                 self.model = policy
