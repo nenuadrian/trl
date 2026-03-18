@@ -135,6 +135,13 @@ class MaxMinPPOTrainer(PPOTrainer):
         if len(reward_models) < 1:
             raise ValueError("At least one reward model must be provided.")
 
+        # Fix score heads BEFORE the parent __init__ wraps them in PolicyAndValueWrapper.
+        # When loading a CausalLM checkpoint as AutoModelForSequenceClassification,
+        # the score head may have the wrong output size (e.g. vocab_size instead of 1).
+        self._fix_score_head(value_model, "value_model")
+        for i, rm in enumerate(reward_models):
+            self._fix_score_head(rm, f"reward_model_{i}")
+
         # Store all reward models before calling super().__init__
         # Pass the first reward model to the parent class as the "primary" reward model
         self.reward_models = reward_models
@@ -182,6 +189,26 @@ class MaxMinPPOTrainer(PPOTrainer):
         self._selected_reward_model_counts = defaultdict(int)
 
         logger.info(f"MaxMin PPO initialized with {self.num_reward_models} reward models, strategy='{args.maxmin_strategy}'")
+
+    @staticmethod
+    def _fix_score_head(model: nn.Module, name: str = "model"):
+        """Ensure a sequence classification model's score head outputs a single scalar.
+
+        When loading a CausalLM checkpoint as AutoModelForSequenceClassification,
+        the score head inherits the wrong output size (often vocab_size=32000).
+        This reinitializes it to nn.Linear(hidden_size, 1).
+        """
+        if hasattr(model, "score") and hasattr(model.score, "out_features"):
+            if model.score.out_features != 1:
+                in_features = model.score.in_features
+                has_bias = model.score.bias is not None
+                logger.warning(
+                    f"{name}: score head has out_features={model.score.out_features}, "
+                    f"reinitializing to nn.Linear({in_features}, 1, bias={has_bias})"
+                )
+                model.score = nn.Linear(in_features, 1, bias=has_bias)
+                if hasattr(model, "config"):
+                    model.config.num_labels = 1
 
     def _aggregate_scores(self, all_scores: list[torch.Tensor]) -> tuple[torch.Tensor, int]:
         """Aggregate scores from multiple reward models according to the MaxMin strategy.
