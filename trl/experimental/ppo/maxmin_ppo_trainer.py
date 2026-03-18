@@ -365,6 +365,10 @@ class MaxMinPPOTrainer(PPOTrainer):
                         _, rm_score, _ = get_reward(
                             rm, postprocessed_query_response, processing_class.pad_token_id, context_length
                         )
+                        # Handle reward models with num_labels > 1 (e.g. CausalLM checkpoint
+                        # loaded as SeqCls without proper score head reinitialization)
+                        if rm_score.dim() > 1:
+                            rm_score = rm_score[:, 0]
                         all_rm_scores[rm_idx].append(rm_score)
 
                     responses.append(response)
@@ -587,3 +591,106 @@ class MaxMinPPOTrainer(PPOTrainer):
 
         # Log final RM selection statistics
         accelerator.print(f"MaxMin RM selection counts: {dict(self._selected_reward_model_counts)}")
+
+    def generate_completions(self, sampling: bool = False):
+        """Override to score with all reward models and handle num_labels > 1."""
+        if self.eval_dataset is None:
+            return
+        args = self.args
+        processing_class = self.processing_class
+        generation_kwargs = {
+            "max_new_tokens": args.response_length,
+            "temperature": (0.01 + 1e-7),
+            "top_k": 0.0,
+            "top_p": 1.0,
+            "do_sample": True,
+        }
+        generation_config = GenerationConfig(**generation_kwargs)
+
+        from collections import defaultdict
+
+        import pandas as pd
+        from accelerate.utils import gather_object
+
+        from ...models.utils import unwrap_model_for_generation
+
+        table = defaultdict(list)
+        with (
+            unwrap_model_for_generation(
+                self.model,
+                self.accelerator,
+                gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                generation_kwargs=generation_kwargs,
+            ) as unwrapped_model
+        ):
+            for batch in self.eval_dataloader:
+                query = batch["input_ids"]
+                with torch.no_grad():
+                    context_length = query.shape[1]
+                    query_response, _ = batch_generation(
+                        unwrapped_model.policy,
+                        query,
+                        query.shape[0],
+                        processing_class.pad_token_id,
+                        generation_config,
+                    )
+                    response = query_response[:, context_length:]
+                    postprocessed_response = response
+                    if self.stop_token_id is not None:
+                        postprocessed_response = truncate_response(
+                            self.stop_token_id, processing_class.pad_token_id, response
+                        )
+                    table["query"].extend(
+                        gather_object(processing_class.batch_decode(query, skip_special_tokens=True))
+                    )
+                    table["model response"].extend(
+                        gather_object(processing_class.batch_decode(postprocessed_response))
+                    )
+
+                    postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                    # Score with all reward models
+                    for rm_idx, rm in enumerate(self.reward_models):
+                        _, score, _ = get_reward(
+                            rm, postprocessed_query_response, processing_class.pad_token_id, context_length
+                        )
+                        if score.dim() > 1:
+                            score = score[:, 0]
+                        table[f"score_rm{rm_idx}"].extend(
+                            self.accelerator.gather_for_metrics(score).float().cpu().numpy()
+                        )
+
+                    # Aggregate for the main "score" column
+                    all_scores = []
+                    for rm_idx in range(self.num_reward_models):
+                        all_scores.append(torch.tensor(table[f"score_rm{rm_idx}"][-query.shape[0]:]))
+                    agg_score, _ = self._aggregate_scores(all_scores)
+                    table["score"].extend(agg_score.float().cpu().numpy())
+
+                if sampling:
+                    break
+        df = pd.DataFrame(table)
+
+        if self.accelerator.is_main_process:
+            from rich.console import Console
+            from rich.table import Table as RichTable
+
+            try:
+                rich_table = RichTable(show_lines=True)
+                for col in df.columns:
+                    rich_table.add_column(col)
+                for _, row in df.head(5).iterrows():
+                    rich_table.add_row(*[str(v) for v in row])
+                Console().print(rich_table)
+            except Exception:
+                print(df.head(5).to_string())
+
+            if "wandb" in args.report_to:
+                import wandb
+
+                if wandb.run is not None:
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+
+            if "comet_ml" in args.report_to:
+                from ...trainer.utils import log_table_to_comet_experiment
+
+                log_table_to_comet_experiment(name="completions.csv", table=df)
