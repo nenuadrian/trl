@@ -112,8 +112,24 @@ if __name__ == "__main__":
     )
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
+    def _fix_score_head(model):
+        """Ensure the classification head outputs a single scalar (num_labels=1).
+
+        When loading a CausalLM checkpoint as AutoModelForSequenceClassification,
+        the score head may inherit the wrong output size from the checkpoint config.
+        This explicitly reinitializes it to nn.Linear(hidden_size, 1).
+        """
+        if hasattr(model, "score"):
+            in_features = model.score.in_features
+            out_features = model.score.out_features
+            if out_features != 1:
+                import torch.nn as nn
+
+                model.score = nn.Linear(in_features, 1, bias=model.score.bias is not None)
+                model.config.num_labels = 1
+        return model
+
     # Load multiple reward models (one per user subpopulation)
-    # ignore_mismatched_sizes=True handles loading CausalLM checkpoints as SeqCls
     reward_models = []
     for rm_path in training_args.reward_model_paths:
         rm = AutoModelForSequenceClassification.from_pretrained(
@@ -123,6 +139,7 @@ if __name__ == "__main__":
             ignore_mismatched_sizes=True,
             **model_kwargs,
         )
+        rm = _fix_score_head(rm)
         reward_models.append(rm)
 
     # Value model (initialized from first reward model)
@@ -133,6 +150,7 @@ if __name__ == "__main__":
         ignore_mismatched_sizes=True,
         **model_kwargs,
     )
+    value_model = _fix_score_head(value_model)
 
     # Policy model
     policy = AutoModelForCausalLM.from_pretrained(
