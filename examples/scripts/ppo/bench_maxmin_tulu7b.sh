@@ -90,6 +90,8 @@ python examples/scripts/ppo/maxmin_ppo.py \
     --missing_eos_penalty 1.0 \
     --logging_steps 5 \
     --num_sample_generations 3 \
+    --report_to wandb \
+    --run_name "maxmin_ppo_tulu7b_${DATASET_PAIR}" \
     --use_peft \
     --lora_r ${LORA_R}
 
@@ -121,6 +123,8 @@ for RATIO in 1 2 6 10; do
         --missing_eos_penalty 1.0 \
         --logging_steps 5 \
         --num_sample_generations 3 \
+        --report_to wandb \
+        --run_name "single_ppo_tulu7b_ratio${RATIO}" \
         --use_peft \
         --lora_r ${LORA_R}
     echo "  -> Saved to ${OUTPUT_ROOT}/single_ppo_ratio${RATIO}"

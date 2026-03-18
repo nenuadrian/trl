@@ -80,7 +80,9 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --missing_eos_penalty 1.0 \
     --stop_token eos \
     --logging_steps 5 \
-    --num_sample_generations 3
+    --num_sample_generations 3 \
+    --report_to wandb \
+    --run_name "maxmin_ppo_multigpu"
 
 echo "  -> Saved to ${OUTPUT_ROOT}/maxmin_ppo"
 echo ""
@@ -109,7 +111,9 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --missing_eos_penalty 1.0 \
     --stop_token eos \
     --logging_steps 5 \
-    --num_sample_generations 3
+    --num_sample_generations 3 \
+    --report_to wandb \
+    --run_name "single_ppo_multigpu"
 
 echo "  -> Saved to ${OUTPUT_ROOT}/single_ppo"
 echo ""

@@ -69,7 +69,9 @@ python examples/scripts/ppo/ppo.py \
     --reward_model_path "${RM_0}" \
     --missing_eos_penalty 1.0 \
     --logging_steps 10 \
-    --num_sample_generations 5
+    --num_sample_generations 5 \
+    --report_to wandb \
+    --run_name "single_ppo_gpt2"
 echo "  -> Saved to ${OUTPUT_ROOT}/single_ppo"
 echo ""
 
@@ -92,7 +94,9 @@ python examples/scripts/ppo/maxmin_ppo.py \
     --maxmin_strategy min \
     --missing_eos_penalty 1.0 \
     --logging_steps 10 \
-    --num_sample_generations 5
+    --num_sample_generations 5 \
+    --report_to wandb \
+    --run_name "maxmin_ppo_gpt2"
 echo "  -> Saved to ${OUTPUT_ROOT}/maxmin_ppo"
 echo ""
 

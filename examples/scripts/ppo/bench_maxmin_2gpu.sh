@@ -97,6 +97,8 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --missing_eos_penalty 1.0 \
     --logging_steps 5 \
     --num_sample_generations 3 \
+    --report_to wandb \
+    --run_name "maxmin_ppo_2gpu" \
     ${USE_PEFT}
 
 echo "  -> Saved to ${OUTPUT_ROOT}/maxmin_ppo"
@@ -126,6 +128,8 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --missing_eos_penalty 1.0 \
     --logging_steps 5 \
     --num_sample_generations 3 \
+    --report_to wandb \
+    --run_name "single_ppo_2gpu" \
     ${USE_PEFT}
 
 echo "  -> Saved to ${OUTPUT_ROOT}/single_ppo"
