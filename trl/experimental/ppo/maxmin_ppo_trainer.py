@@ -643,3 +643,37 @@ class MaxMinPPOTrainer(PPOTrainer):
 
     # generate_completions is inherited from PPOTrainer — it scores with
     # self.reward_model (the first RM) which is sufficient for eval logging.
+
+    def save_model(self, output_dir: str | None = None, _internal_call: bool = False):
+        """Save the policy model, handling DeepSpeed config resolution correctly."""
+        if output_dir is None:
+            output_dir = self.args.output_dir
+
+        if not _internal_call and hasattr(self.model, "policy"):
+            # Extract the policy model for saving
+            policy = self.model.policy
+            if self.is_deepspeed_enabled:
+                # Save via DeepSpeed engine's save_checkpoint or state_dict
+                import deepspeed
+
+                # The DeepSpeed engine is self.model_wrapped or self.deepspeed
+                # We need to save just the policy weights
+                state_dict = self.accelerator.get_state_dict(self.deepspeed)
+                if self.accelerator.is_main_process:
+                    # Filter to only policy keys
+                    policy_prefix = "policy."
+                    policy_state_dict = {}
+                    for k, v in state_dict.items():
+                        if k.startswith(policy_prefix):
+                            policy_state_dict[k[len(policy_prefix) :]] = v
+
+                    policy.save_pretrained(output_dir, state_dict=policy_state_dict)
+                    if self.processing_class is not None:
+                        self.processing_class.save_pretrained(output_dir)
+            else:
+                backup_model = self.model
+                self.model = policy
+                super(MaxMinPPOTrainer, self).save_model(output_dir, _internal_call)
+                self.model = backup_model
+        else:
+            super(MaxMinPPOTrainer, self).save_model(output_dir, _internal_call)
