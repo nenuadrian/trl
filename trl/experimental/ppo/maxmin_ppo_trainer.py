@@ -168,6 +168,16 @@ class MaxMinPPOTrainer(PPOTrainer):
             else:
                 self.reward_models[i] = self.reward_models[i].to(self.accelerator.device)
 
+        # Validate that reward models and value model have num_labels=1
+        for i, rm in enumerate(self.reward_models):
+            num_labels = getattr(rm.config, "num_labels", None)
+            if num_labels is not None and num_labels != 1:
+                logger.warning(
+                    f"Reward model {i} has num_labels={num_labels} (expected 1). "
+                    f"This may happen when loading a CausalLM checkpoint as AutoModelForSequenceClassification. "
+                    f"Only the first label dimension will be used."
+                )
+
         # Track which reward model was selected at each step (for logging)
         self._selected_reward_model_counts = defaultdict(int)
 
@@ -341,7 +351,14 @@ class MaxMinPPOTrainer(PPOTrainer):
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    value = full_value[:, context_length - 1 : -1]
+                    # Ensure value is 2D (batch, seq). When num_labels > 1 (e.g. score head
+                    # initialized from a causal LM checkpoint), take only the first label.
+                    if value.dim() == 3:
+                        if value.size(-1) == 1:
+                            value = value.squeeze(-1)
+                        else:
+                            value = value[:, :, 0]
 
                     # Score with each reward model
                     for rm_idx, rm in enumerate(reward_models):

@@ -113,12 +113,14 @@ if __name__ == "__main__":
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
     # Load multiple reward models (one per user subpopulation)
+    # ignore_mismatched_sizes=True handles loading CausalLM checkpoints as SeqCls
     reward_models = []
     for rm_path in training_args.reward_model_paths:
         rm = AutoModelForSequenceClassification.from_pretrained(
             rm_path,
             trust_remote_code=model_args.trust_remote_code,
             num_labels=1,
+            ignore_mismatched_sizes=True,
             **model_kwargs,
         )
         reward_models.append(rm)
@@ -128,6 +130,7 @@ if __name__ == "__main__":
         training_args.reward_model_paths[0],
         trust_remote_code=model_args.trust_remote_code,
         num_labels=1,
+        ignore_mismatched_sizes=True,
         **model_kwargs,
     )
 
