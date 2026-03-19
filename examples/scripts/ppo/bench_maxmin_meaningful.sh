@@ -66,8 +66,8 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --missing_eos_penalty 1.0 \
     --logging_steps 1 \
     --num_sample_generations 3 \
-    --bf16 \
-    --gradient_checkpointing \
+    --bf16 true \
+    --gradient_checkpointing true \
     --report_to wandb \
     --run_name "maxmin_ppo_meaningful"
 
@@ -100,8 +100,8 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --missing_eos_penalty 1.0 \
     --logging_steps 1 \
     --num_sample_generations 3 \
-    --bf16 \
-    --gradient_checkpointing \
+    --bf16 true \
+    --gradient_checkpointing true \
     --report_to wandb \
     --run_name "single_ppo_meaningful"
 
