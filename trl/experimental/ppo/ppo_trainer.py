@@ -579,20 +579,27 @@ class PPOTrainer(BaseTrainer):
                 self.model.policy.set_adapter(self.model_adapter_name or "default")
 
     def save_model(self, output_dir: str | None = None, _internal_call: bool = False):
-        if not _internal_call:
-            backup_model = self.model
-            if hasattr(self.model, "policy"):
-                self.model = self.model.policy  # save only the policy for inference
-            if self.is_deepspeed_enabled:
-                backup_deepspeed = self.deepspeed
-                self.deepspeed = self.model
+        if output_dir is None:
+            output_dir = self.args.output_dir
 
-        super().save_model(output_dir, _internal_call)
-
-        if not _internal_call:
-            self.model = backup_model
+        if not _internal_call and hasattr(self.model, "policy"):
+            policy = self.model.policy
             if self.is_deepspeed_enabled:
-                self.deepspeed = backup_deepspeed
+                # Use DeepSpeed's native checkpoint save to avoid
+                # self.deepspeed.config resolving to the HF model config
+                self.deepspeed.save_checkpoint(output_dir)
+                if self.accelerator.is_main_process:
+                    policy.config.save_pretrained(output_dir)
+                    if self.processing_class is not None:
+                        self.processing_class.save_pretrained(output_dir)
+                self.accelerator.wait_for_everyone()
+            else:
+                backup_model = self.model
+                self.model = policy
+                super().save_model(output_dir, _internal_call)
+                self.model = backup_model
+        else:
+            super().save_model(output_dir, _internal_call)
 
     def train(self):
         args = self.args

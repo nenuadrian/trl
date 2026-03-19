@@ -21,7 +21,7 @@ set -euo pipefail
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/bench_maxmin_meaningful}"
 TOTAL_EPISODES="${TOTAL_EPISODES:-5000}"
-LR="${LR:-3e-6}"
+LR="${LR:-1e-6}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 
 # Use ZeRO-2 by default (1.5B model is small enough)
@@ -60,9 +60,9 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --num_ppo_epochs 1 \
     --num_mini_batches 1 \
     --local_rollout_forward_batch_size ${BATCH_SIZE} \
-    --kl_coef 0.05 \
+    --kl_coef 0.2 \
     --response_length 128 \
-    --temperature 0.7 \
+    --temperature 0.5 \
     --missing_eos_penalty 1.0 \
     --logging_steps 1 \
     --num_sample_generations 3 \
@@ -94,9 +94,9 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --num_ppo_epochs 1 \
     --num_mini_batches 1 \
     --local_rollout_forward_batch_size ${BATCH_SIZE} \
-    --kl_coef 0.05 \
+    --kl_coef 0.2 \
     --response_length 128 \
-    --temperature 0.7 \
+    --temperature 0.5 \
     --missing_eos_penalty 1.0 \
     --logging_steps 1 \
     --num_sample_generations 3 \
