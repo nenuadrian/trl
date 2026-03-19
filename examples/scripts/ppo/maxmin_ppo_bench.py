@@ -138,7 +138,7 @@ if __name__ == "__main__":
         ref_policy = None
 
     ################
-    # Dataset
+    # Dataset — apply chat template so the model stays in-distribution
     ################
     dataset = load_dataset(
         script_args.dataset_name, name=script_args.dataset_config, split=script_args.dataset_train_split
@@ -149,9 +149,22 @@ if __name__ == "__main__":
     dataset_text_field = "prompt"
 
     def prepare_dataset(dataset, tokenizer):
+        """Tokenize prompts wrapped in chat template for instruct models."""
+
         def tokenize(element):
-            outputs = tokenizer(element[dataset_text_field], padding=False)
-            return {"input_ids": outputs["input_ids"]}
+            prompts = element[dataset_text_field]
+            input_ids_list = []
+            for prompt in prompts:
+                # Wrap in chat template so the model generates in its native format
+                messages = [{"role": "user", "content": prompt}]
+                # add_generation_prompt=True appends the assistant turn prefix
+                # so the model can immediately start generating a response
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                ids = tokenizer(text, padding=False, add_special_tokens=False)["input_ids"]
+                input_ids_list.append(ids)
+            return {"input_ids": input_ids_list}
 
         return dataset.map(
             tokenize,
@@ -163,6 +176,11 @@ if __name__ == "__main__":
     with PartialState().local_main_process_first():
         train_dataset = prepare_dataset(train_dataset, tokenizer)
         eval_dataset = prepare_dataset(eval_dataset, tokenizer)
+
+    # Log a sample to verify formatting
+    if PartialState().is_main_process:
+        sample = tokenizer.decode(train_dataset[0]["input_ids"])
+        print(f"[bench] Sample tokenized prompt (first 200 chars):\n{sample[:200]}")
 
     ################
     # Training

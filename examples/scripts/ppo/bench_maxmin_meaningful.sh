@@ -6,11 +6,13 @@
 # DIFFERENT score heads (different random seeds), so the MaxMin mechanism
 # actually triggers. Compares against single-RM PPO baseline.
 #
-# Key differences from bench_maxmin_2gpu.sh:
-#   - Smaller model (1.5B vs 7B) → faster iteration, fits easily on 2 GPUs
-#   - Different RM initializations → rm_0 and rm_1 give different scores
-#   - MaxMin actually selects between RMs (selected_rm_idx varies)
-#   - Includes comparison run with single PPO
+# Key design choices:
+#   - Chat template applied to prompts → model stays in-distribution (low KL)
+#   - stop_token=eos → model learns to generate EOS
+#   - kl_coef=0.5 → prevents policy drift
+#   - learning_rate=3e-7 → conservative updates
+#   - temperature=0.7 → reasonable diversity
+#   - Different RM seeds → MaxMin mechanism exercises properly
 #
 # Hardware: 2x GPUs (any with >=24GB VRAM)
 # Runtime: ~20-40 min total (both runs)
@@ -21,8 +23,9 @@ set -euo pipefail
 BASE_MODEL="${BASE_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/bench_maxmin_meaningful}"
 TOTAL_EPISODES="${TOTAL_EPISODES:-5000}"
-LR="${LR:-1e-6}"
+LR="${LR:-3e-7}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
+KL_COEF="${KL_COEF:-0.5}"
 
 # Use ZeRO-2 by default (1.5B model is small enough)
 DS_CONFIG="${DS_CONFIG:-examples/accelerate_configs/deepspeed_zero2_2gpu.yaml}"
@@ -35,6 +38,8 @@ echo " RMs:       2x ${BASE_MODEL} (different score head seeds)"
 echo " Config:    ${DS_CONFIG}"
 echo " Batch:     ${BATCH_SIZE}/GPU"
 echo " Episodes:  ${TOTAL_EPISODES}"
+echo " LR:        ${LR}"
+echo " KL coef:   ${KL_COEF}"
 echo "============================================================"
 echo ""
 
@@ -60,10 +65,11 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --num_ppo_epochs 1 \
     --num_mini_batches 1 \
     --local_rollout_forward_batch_size ${BATCH_SIZE} \
-    --kl_coef 0.2 \
-    --response_length 128 \
-    --temperature 0.5 \
+    --kl_coef ${KL_COEF} \
+    --stop_token eos \
     --missing_eos_penalty 1.0 \
+    --response_length 128 \
+    --temperature 0.7 \
     --logging_steps 1 \
     --num_sample_generations 3 \
     --bf16 true \
@@ -94,10 +100,11 @@ accelerate launch --config_file "${DS_CONFIG}" \
     --num_ppo_epochs 1 \
     --num_mini_batches 1 \
     --local_rollout_forward_batch_size ${BATCH_SIZE} \
-    --kl_coef 0.2 \
-    --response_length 128 \
-    --temperature 0.5 \
+    --kl_coef ${KL_COEF} \
+    --stop_token eos \
     --missing_eos_penalty 1.0 \
+    --response_length 128 \
+    --temperature 0.7 \
     --logging_steps 1 \
     --num_sample_generations 3 \
     --bf16 true \
@@ -114,8 +121,9 @@ echo "   - maxmin_ppo_meaningful  (2 RMs, min aggregation)"
 echo "   - single_ppo_meaningful  (1 RM baseline)"
 echo ""
 echo " Key metrics to compare:"
+echo "   - objective/kl           (should be 1-10, not 50+)"
 echo "   - objective/scores       (should differ if MaxMin is working)"
-echo "   - objective/kl           (MaxMin may be more conservative)"
+echo "   - val/num_eos_tokens     (should be >0, model generates EOS)"
 echo "   - policy/entropy_avg     (MaxMin should preserve diversity)"
 echo "   - maxmin/selected_rm_idx (should vary if RMs disagree)"
 echo "============================================================"
