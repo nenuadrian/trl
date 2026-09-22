@@ -1,3 +1,5 @@
+qwen-pmpo-lmsys/
+dpo-qwen05b/
 *.bak
 .gitattributes
 .last_checked
